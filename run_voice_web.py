@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 import uvicorn
@@ -34,7 +35,34 @@ from run_voice_chat import DEFAULT_PROMPT, VoiceConfigurationError, voice_profil
 WEB_DIR = Path(__file__).parent / "web"
 PORT = 18768
 log = logging.getLogger(__name__)
-audio_in_use = asyncio.Lock()
+
+
+class _ThreadSafeAsyncLock:
+    """An asyncio-compatible lock that works safely across event loops."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def acquire(self) -> bool:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._lock.acquire)
+
+    def release(self) -> None:
+        if self._lock.locked():
+            self._lock.release()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
+audio_in_use = _ThreadSafeAsyncLock()
 active_session_stop = None
 
 def run_startup_migrations(target_app: FastAPI) -> dict:
@@ -250,6 +278,21 @@ async def session(websocket: WebSocket):
         except asyncio.CancelledError:
             pass
 
+    async def _safe_cancel_task(task: asyncio.Task | None) -> None:
+        if task is None or task.done():
+            return
+        task_loop = task.get_loop()
+        try:
+            cur_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            cur_loop = None
+        if task_loop is cur_loop:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        else:
+            task_loop.call_soon_threadsafe(task.cancel)
+
     async def stop_voice() -> None:
         global active_session_stop
         if active_session_stop is stop_voice:
@@ -257,16 +300,23 @@ async def session(websocket: WebSocket):
         nonlocal voice_task, output_task, conversation, input_buffer
         input_buffer.clear()
         if output_task is not None:
-            output_task.cancel()
-            await asyncio.gather(output_task, return_exceptions=True)
+            await _safe_cancel_task(output_task)
             output_task = None
         if conversation is not None:
             conversation.stop()
             with contextlib.suppress(Exception):
-                await conversation.input.put(None)
+                try:
+                    cur_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    cur_loop = None
+                input_queue = conversation.input
+                queue_loop = getattr(input_queue, "_loop", None)
+                if queue_loop is cur_loop or cur_loop is None or queue_loop is None:
+                    input_queue.put_nowait(None)
+                else:
+                    queue_loop.call_soon_threadsafe(input_queue.put_nowait, None)
         if voice_task is not None:
-            voice_task.cancel()
-            await asyncio.gather(voice_task, return_exceptions=True)
+            await _safe_cancel_task(voice_task)
             voice_task = None
         conversation = None
 
@@ -483,10 +533,10 @@ async def session(websocket: WebSocket):
                             await conversation.run()
                         finally:
                             if output_task is not None:
-                                output_task.cancel()
-                                await asyncio.gather(output_task, return_exceptions=True)
+                                await _safe_cancel_task(output_task)
                                 output_task = None
-                            await conversation.client.close()
+                            if conversation is not None and getattr(conversation, "client", None) is not None:
+                                await conversation.client.close()
                     finally:
                         await speech.aclose()
             except VoiceConfigurationError as exc:
