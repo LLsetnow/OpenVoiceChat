@@ -235,6 +235,39 @@ h2 { font-size: 15px; font-weight: 670; }
 [data-role="user"] .bubble-text { background: var(--wash); border-color: var(--wash); }
 .bubble[data-draft="true"] .bubble-text { color: var(--muted); }
 
+.bubble-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+.btn-retry-speak {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: all .15s ease;
+}
+.btn-retry-speak:hover {
+  background: var(--wash);
+  color: var(--ink);
+  border-color: var(--muted);
+}
+.bubble[data-tts-error="true"] .bubble-text {
+  border-color: #e06c75;
+}
+.bubble[data-tts-error="true"] .btn-retry-speak {
+  border-color: #e06c75;
+  color: #e06c75;
+  font-weight: 600;
+}
+
 .timing-list { padding: 0 19px; }
 .metric {
   display: grid; align-items: baseline; grid-template-columns: minmax(0, 1fr) auto;

@@ -80,6 +80,8 @@
       char_deleted_fallback: "原角色配置已不存在，已回退至默认角色：{name}。",
       legacy_settings_fallback: "未找到历史语音配置，已采用角色默认语音设置。",
       new_conversation: "新对话",
+      db_migration_failed: "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+      db_migration_recovery: "请运行 python -m openvoicechat.migrate 恢复数据库。",
 
       // 对话面板
       dialogue_title: "对话记录",
@@ -135,6 +137,10 @@
       phase_can_continue: "可以继续说话",
       phase_no_reply: "这轮没有生成回复，可以继续说话",
       phase_interrupted: "已打断，{name}正在聆听",
+      retry_read: "重试朗读",
+      retry_read_aria: "重新朗读此条回复",
+      tts_error_notice: "语音合成超时或失败，已保留文字回复，可点击重试朗读。",
+      phase_tts_error: "语音合成失败，已保留文字",
       mic_error: "麦克风启动失败：{error}。请检查浏览器麦克风权限。"
     },
     en: {
@@ -217,6 +223,8 @@
       char_deleted_fallback: "The original character profile no longer exists. Reverted to default character: {name}.",
       legacy_settings_fallback: "No legacy voice settings found. Character default voice settings have been applied.",
       new_conversation: "New conversation",
+      db_migration_failed: "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+      db_migration_recovery: "Please run python -m openvoicechat.migrate to restore the database.",
 
       // Dialogue panel
       dialogue_title: "Conversation",
@@ -272,6 +280,10 @@
       phase_can_continue: "Ready for more speech",
       phase_no_reply: "No reply generated this turn, please speak again",
       phase_interrupted: "Interrupted, {name} is listening",
+      retry_read: "Retry Voice",
+      retry_read_aria: "Retry reading this reply",
+      tts_error_notice: "Voice synthesis timed out or failed; text reply preserved, click to retry reading.",
+      phase_tts_error: "Voice synthesis failed; text preserved",
       mic_error: "Microphone failed to start: {error}. Please check browser microphone permissions."
     },
   };

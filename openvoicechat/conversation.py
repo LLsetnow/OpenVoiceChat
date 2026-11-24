@@ -343,6 +343,72 @@ class Conversation:
         self._need_reset = True
         self._turn_task = asyncio.create_task(self._turn(text=text))
 
+    async def retry_speak(self, text: str | None = None) -> None:
+        """Re-synthesize and play speech for an existing reply without calling LLM or adding to history."""
+        if self._stop.is_set():
+            return
+        if text is None:
+            for message in reversed(self.messages):
+                if message.get("role") == "assistant" and isinstance(message.get("content"), str):
+                    candidate = message["content"].strip()
+                    if candidate:
+                        text = candidate
+                        break
+        if not text or not text.strip():
+            return
+        text = text.strip()
+
+        if self._turn_task is not None or self.agent_speaking:
+            await self._interrupt()
+        _drain(self.input)
+        self._need_reset = True
+        self._turn_task = asyncio.create_task(self._speak_reply(text))
+
+    async def speak_text(self, text: str) -> None:
+        """Alias for retry_speak with explicit text."""
+        await self.retry_speak(text)
+
+    async def _speak_reply(self, text: str) -> None:
+        """Synthesize and stream audio chunks for an existing reply text."""
+        spoken: list[str] = []
+        sentences: asyncio.Queue[str | None] = asyncio.Queue(maxsize=16)
+        tts_task = asyncio.create_task(self._speak(sentences, spoken, 0.0))
+        tts_error: Exception | None = None
+        try:
+            parts = _split_sentences(text)
+            for part in parts:
+                await self._feed(sentences, part, tts_task)
+            await self._feed(sentences, None, tts_task)
+            await tts_task
+        except asyncio.CancelledError:
+            self._log(f"retry_speak cancelled | spoken={len(spoken)}")
+            self.agent_speaking = False
+            self.input_paused = False
+            self._event("mic_paused", paused=False)
+            self._event("interrupted")
+            raise
+        except Exception as exc:
+            tts_error = exc
+            log.exception("retry_speak failed")
+            self._log(f"retry_speak error: {exc!r}")
+            self.agent_speaking = False
+            self.input_paused = False
+            self._event("mic_paused", paused=False)
+            self._event("tts_error", error=str(exc), message_key="tts_error_notice")
+        finally:
+            if tts_task is not None and not tts_task.done():
+                tts_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await tts_task
+            if not spoken or tts_error is not None:
+                self.agent_speaking = False
+                self.input_paused = False
+                self._event("mic_paused", paused=False)
+            if not self._stop.is_set():
+                await self.output.put(None)
+            with contextlib.suppress(asyncio.QueueFull):
+                self.input.put_nowait(b"")
+
     async def _turn(
         self,
         pcm: bytes = b"",
@@ -435,18 +501,30 @@ class Conversation:
             if buffer.strip():
                 await self._feed(sentences, buffer.strip(), tts_task)
             await self._feed(sentences, None, tts_task)
-            await tts_task
-
-            if not spoken:
-                self.agent_speaking = False
-                self.input_paused = False
-                self._event("mic_paused", paused=False)
             if response.strip():
                 self.messages.append({"role": "assistant", "content": response})
                 self._emit("assistant", response)
                 completed = True
             else:
                 self._event("empty_reply")
+
+            tts_error: Exception | None = None
+            try:
+                await tts_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                tts_error = exc
+                log.exception("tts synthesis failed")
+
+            if not spoken or tts_error is not None:
+                self.agent_speaking = False
+                self.input_paused = False
+                self._event("mic_paused", paused=False)
+
+            if tts_error is not None:
+                self._log(f"TTS error: {tts_error!r}")
+                self._event("tts_error", error=str(tts_error), message_key="tts_error_notice")
         except asyncio.CancelledError:
             self._log(f"turn cancelled | spoken_sentences={len(spoken)}")
             partial = " ".join(spoken).strip()
@@ -489,7 +567,7 @@ class Conversation:
             with contextlib.suppress(asyncio.QueueFull):
                 self.input.put_nowait(b"")
 
-    async def _speak(self, sentences: asyncio.Queue, spoken: list[str], llm_started: float) -> None:
+    async def _speak(self, sentences: asyncio.Queue, spoken: list[str], llm_started: float = 0.0) -> None:
         first_segment = True
         while True:
             sentence = await sentences.get()
@@ -497,9 +575,10 @@ class Conversation:
                 return
             tts_started = time.monotonic()
             if first_segment:
-                self._event(
-                    "timing", stage="llm", milliseconds=round(1000 * (tts_started - llm_started))
-                )
+                if llm_started > 0:
+                    self._event(
+                        "timing", stage="llm", milliseconds=round(1000 * (tts_started - llm_started))
+                    )
                 self._event("tts_start")
             audio = await self.speech.synthesize(sentence)
             tts_ms = round(1000 * (time.monotonic() - tts_started))
@@ -518,7 +597,9 @@ class Conversation:
                 await self.output.put(audio[start : start + self._chunk_bytes])
 
     @staticmethod
-    async def _feed(queue: asyncio.Queue, item, tts_task: asyncio.Task) -> None:
+    async def _feed(queue: asyncio.Queue, item, tts_task: asyncio.Task) -> bool:
+        if tts_task.done():
+            return False
         put = asyncio.create_task(queue.put(item))
         try:
             done, _ = await asyncio.wait((put, tts_task), return_when=asyncio.FIRST_COMPLETED)
@@ -528,10 +609,10 @@ class Conversation:
             raise
         if put in done:
             put.result()
-            return
+            return True
         put.cancel()
         await asyncio.gather(put, return_exceptions=True)
-        tts_task.result()
+        return False
 
     async def _interrupt(self) -> None:
         self._log(f"barge-in | cancelling turn, output_chunks={self.output.qsize()}")
@@ -676,3 +757,33 @@ def _drain(queue: asyncio.Queue) -> None:
 async def _read_frames(queue: asyncio.Queue[bytes | None]):
     while (frame := await queue.get()) is not None:
         yield frame
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences using CJK and Western punctuation boundaries."""
+    text = text.strip()
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    for match in SENTENCE_END_CJK.finditer(text):
+        sentence = text[start : match.end()].strip()
+        if sentence:
+            chunks.append(sentence)
+        start = match.end()
+    remaining = text[start:].strip()
+    if remaining:
+        chunks.append(remaining)
+
+    segmenter = pysbd.Segmenter(language="en", clean=False)
+    result = []
+    for chunk in chunks:
+        if any(mark in chunk for mark in ".!?\n"):
+            sub_parts = segmenter.segment(chunk)
+            for part in sub_parts:
+                part = part.strip()
+                if part:
+                    result.append(part)
+        else:
+            result.append(chunk)
+    return result or [text]
