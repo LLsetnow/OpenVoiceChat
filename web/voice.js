@@ -19,6 +19,13 @@ const langToggle = element("lang-toggle");
 const textForm = element("text-form");
 const textInput = element("text-input");
 const textSendBtn = element("text-send-btn");
+const deleteBtn = element("delete-btn");
+const exportBtn = element("export-btn");
+const exportMenu = element("export-menu");
+const exportJsonBtn = element("export-json-btn");
+const exportMdBtn = element("export-md-btn");
+const ephemeralToggle = element("ephemeral-toggle");
+const ephemeralBadge = element("ephemeral-badge");
 const avatars = () => document.querySelectorAll("[data-avatar]");
 function setAvatar(src) {
   if (src && typeof src === "string" && src.startsWith("/assets/")) {
@@ -284,6 +291,15 @@ function updateControls() {
     const isSocketOpen = socket && socket.readyState === WebSocket.OPEN;
     textInput.disabled = !isSocketOpen || state === "stopping";
   }
+  if (deleteBtn) {
+    deleteBtn.disabled = !selectedConversationId || state !== "idle";
+  }
+  if (exportBtn) {
+    exportBtn.disabled = !selectedConversationId && !currentConversationMessages.length;
+  }
+  if (ephemeralToggle) {
+    ephemeralToggle.disabled = state !== "idle";
+  }
 }
 
 async function refreshConversationList() {
@@ -330,6 +346,17 @@ async function refreshConversationList() {
         month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
       });
       item.append(title, preview, date);
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "history-item-delete";
+      delBtn.setAttribute("aria-label", t("delete_chat"));
+      delBtn.setAttribute("title", t("delete_chat_title"));
+      delBtn.textContent = "×";
+      delBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteConversation(conversation.id);
+      });
+      item.appendChild(delBtn);
       item.addEventListener("click", () => openConversation(conversation.id));
       historyList.appendChild(item);
     }
@@ -354,6 +381,10 @@ async function refreshConversationList() {
 
 async function openConversation(id) {
   if (state !== "idle" && state !== "connecting") return;
+  if (ephemeralToggle && ephemeralToggle.checked) {
+    ephemeralToggle.checked = false;
+    if (ephemeralBadge) ephemeralBadge.hidden = true;
+  }
   try {
     const response = await fetch(`${apiBase}/api/conversations/${encodeURIComponent(id)}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -405,6 +436,121 @@ function startNewConversation() {
 }
 
 newConversationButton?.addEventListener("click", startNewConversation);
+
+async function deleteConversation(id) {
+  if (!window.confirm(t("delete_confirm"))) return;
+  try {
+    const res = await fetch(`${apiBase}/api/conversations/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (selectedConversationId === id) {
+      selectedConversationId = null;
+      try {
+        localStorage.removeItem("openvoicechat.selected_conversation");
+      } catch {}
+      renderConversationMessages([]);
+    }
+    notice(t("delete_success"));
+    await refreshConversationList();
+    updateControls();
+  } catch (err) {
+    console.warn("Delete conversation failed", err);
+    notice(t("delete_failed"));
+  }
+}
+
+function downloadBlob(content, filename, contentType) {
+  const blob = new Blob([content], { type: contentType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function exportConversation(format) {
+  if (exportMenu) exportMenu.hidden = true;
+  if (selectedConversationId) {
+    const a = document.createElement("a");
+    a.href = `${apiBase}/api/conversations/${encodeURIComponent(selectedConversationId)}/export?format=${encodeURIComponent(format)}`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    return;
+  }
+  if (!currentConversationMessages.length) {
+    notice(t("export_empty"));
+    return;
+  }
+  const title = t("new_conversation");
+  const charName = (charNameDisplay && charNameDisplay.textContent) || "千夏";
+  if (format === "markdown" || format === "md") {
+    let md = `# ${title}\n\n- **角色**: ${charName}\n\n---\n\n`;
+    for (const msg of currentConversationMessages) {
+      const roleLabel = msg.role === "user" ? t("user_name") : charName;
+      md += `### ${roleLabel}\n\n${msg.content}\n\n`;
+    }
+    downloadBlob(md, `${title}.md`, "text/markdown;charset=utf-8");
+  } else {
+    const data = {
+      title,
+      character_name: charName,
+      messages: currentConversationMessages,
+    };
+    downloadBlob(JSON.stringify(data, null, 2), `${title}.json`, "application/json;charset=utf-8");
+  }
+}
+
+deleteBtn?.addEventListener("click", () => {
+  if (selectedConversationId) {
+    deleteConversation(selectedConversationId);
+  }
+});
+
+exportBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (exportMenu) {
+    exportMenu.hidden = !exportMenu.hidden;
+  }
+});
+
+document.addEventListener("click", () => {
+  if (exportMenu) exportMenu.hidden = true;
+});
+
+exportJsonBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  exportConversation("json");
+});
+
+exportMdBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  exportConversation("markdown");
+});
+
+ephemeralToggle?.addEventListener("change", () => {
+  if (ephemeralToggle.checked) {
+    selectedConversationId = null;
+    try {
+      localStorage.removeItem("openvoicechat.selected_conversation");
+    } catch {}
+    renderConversationMessages([]);
+    if (ephemeralBadge) ephemeralBadge.hidden = false;
+    if (historyList) {
+      for (const el of historyList.querySelectorAll(".history-item")) {
+        el.dataset.active = "false";
+      }
+    }
+  } else {
+    if (ephemeralBadge) ephemeralBadge.hidden = true;
+  }
+  updateControls();
+});
 
 function updateMicStatus() {
   const isAudioPlaying = typeof activeSources !== "undefined" && activeSources ? activeSources.size > 0 : false;
@@ -919,8 +1065,23 @@ function onEvent(event) {
   switch (event.kind) {
     case "state": setState(event.state); break;
     case "conversation":
-      selectedConversationId = event.id;
-      refreshConversationList();
+      if (event.ephemeral) {
+        selectedConversationId = null;
+        try {
+          localStorage.removeItem("openvoicechat.selected_conversation");
+        } catch {}
+        if (ephemeralBadge) ephemeralBadge.hidden = false;
+        if (ephemeralToggle) ephemeralToggle.checked = true;
+      } else {
+        selectedConversationId = event.id;
+        try {
+          if (event.id) {
+            localStorage.setItem("openvoicechat.selected_conversation", event.id);
+          }
+        } catch {}
+        refreshConversationList();
+      }
+      updateControls();
       break;
     case "mic_paused":
       if (state === "running") {
@@ -1077,6 +1238,7 @@ button.addEventListener("click", async () => {
     setState("starting");
     try {
       await startAudioRecording();
+      const isEphemeral = Boolean(ephemeralToggle && ephemeralToggle.checked);
       socket.send(JSON.stringify({
         action: "start",
         mode: voiceMode.value,
@@ -1085,7 +1247,9 @@ button.addEventListener("click", async () => {
         character: charSelect ? charSelect.value : "mio",
         voice: voiceSelect ? voiceSelect.value : "chinatsu",
         tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
-        conversation_id: selectedConversationId,
+        conversation_id: isEphemeral ? null : selectedConversationId,
+        ephemeral: isEphemeral,
+        save_history: !isEphemeral,
       }));
     } catch (err) {
       console.error("Failed to start audio recording", err);
@@ -1129,8 +1293,14 @@ async function submitTextMessage() {
   }
 
   textInput.value = "";
+  const isEphemeral = Boolean(ephemeralToggle && ephemeralToggle.checked);
   if (state === "running") {
-    socket.send(JSON.stringify({ action: "text", text }));
+    socket.send(JSON.stringify({
+      action: "text",
+      text,
+      ephemeral: isEphemeral,
+      save_history: !isEphemeral,
+    }));
     phase(t("phase_llm_generating", { name: names.assistant }), "llm");
   } else if (state === "idle") {
     setState("starting");
@@ -1153,7 +1323,9 @@ async function submitTextMessage() {
       character: charSelect ? charSelect.value : "mio",
       voice: voiceSelect ? voiceSelect.value : "chinatsu",
       tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
-      conversation_id: selectedConversationId,
+      conversation_id: isEphemeral ? null : selectedConversationId,
+      ephemeral: isEphemeral,
+      save_history: !isEphemeral,
     }));
   }
 }
@@ -1170,13 +1342,16 @@ async function retrySpeakText(text) {
 
   notice();
   phase(t("phase_tts_synthesizing", { name: names.assistant }), "tts");
+  const isEphemeral = Boolean(ephemeralToggle && ephemeralToggle.checked);
   const payload = {
     action: "retry_speak",
     text: trimmed,
     character: charSelect ? charSelect.value : "mio",
     voice: voiceSelect ? voiceSelect.value : "chinatsu",
     tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
-    conversation_id: selectedConversationId,
+    conversation_id: isEphemeral ? null : selectedConversationId,
+    ephemeral: isEphemeral,
+    save_history: !isEphemeral,
   };
 
   if (state === "running") {

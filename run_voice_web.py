@@ -5,12 +5,15 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import re
 import sqlite3
+import urllib.parse
 from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -23,6 +26,8 @@ from openvoicechat.conversation import Conversation
 from openvoicechat.history import (
     append_message,
     create_conversation,
+    delete_conversation,
+    export_conversation_markdown,
     get_conversation,
     list_conversations,
     update_conversation_settings,
@@ -88,6 +93,7 @@ async def lifespan(target_app: FastAPI):
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.state.tts_steps = TTS_SAMPLE_STEPS
+app.state.log_full_text = False
 app.state.database_status = None
 app.state.migration_error = None
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
@@ -171,6 +177,80 @@ async def api_conversation(conversation_id: str):
     if conversation is None:
         raise HTTPException(status_code=404, detail="conversation_not_found")
     return conversation
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def api_delete_conversation(conversation_id: str):
+    status = ensure_database_ready(app)
+    if status.get("status") == "error":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "database_migration_failed",
+                "message_key": "db_migration_failed",
+                "message": status.get(
+                    "message_zh",
+                    "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+                ),
+                "message_en": status.get(
+                    "message_en",
+                    "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+                ),
+                "recovery": status.get("recovery", "python -m openvoicechat.migrate"),
+                "detail": status.get("error"),
+            },
+        )
+    deleted = delete_conversation(conversation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="conversation_not_found")
+    return {"status": "ok", "deleted": True, "id": conversation_id}
+
+
+@app.get("/api/conversations/{conversation_id}/export")
+async def api_export_conversation(conversation_id: str, format: str = "json"):
+    status = ensure_database_ready(app)
+    if status.get("status") == "error":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "database_migration_failed",
+                "message_key": "db_migration_failed",
+                "message": status.get(
+                    "message_zh",
+                    "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+                ),
+                "message_en": status.get(
+                    "message_en",
+                    "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+                ),
+                "recovery": status.get("recovery", "python -m openvoicechat.migrate"),
+                "detail": status.get("error"),
+            },
+        )
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="conversation_not_found")
+
+    raw_title = conversation.get("title") or "conversation"
+    safe_title = re.sub(r'[\\/*?:"<>|]', "_", raw_title).strip() or f"conversation_{conversation_id[:8]}"
+    fmt = format.lower()
+    if fmt in ("md", "markdown"):
+        md_text = export_conversation_markdown(conversation)
+        filename = f"{safe_title}.md"
+        encoded_fn = urllib.parse.quote(filename)
+        return Response(
+            content=md_text,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_fn}"},
+        )
+    json_text = json.dumps(conversation, ensure_ascii=False, indent=2)
+    filename = f"{safe_title}.json"
+    encoded_fn = urllib.parse.quote(filename)
+    return Response(
+        content=json_text,
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_fn}"},
+    )
 
 
 @app.get("/api/voices")
@@ -270,14 +350,17 @@ async def session(websocket: WebSocket):
             voice_task = None
         conversation = None
 
-    def on_turn(conversation_id: str, role: str, text: str) -> None:
+    def on_turn(
+        conversation_id: str | None, role: str, text: str, is_ephemeral: bool = False
+    ) -> None:
         if role == "error":
             publish("error", message="本轮对话失败，请再说一次。")
         else:
-            try:
-                append_message(conversation_id, role, text)
-            except (DatabaseMigrationError, OSError, RuntimeError) as exc:
-                log.error("Failed to append message to conversation: %s", exc)
+            if not is_ephemeral and conversation_id is not None:
+                try:
+                    append_message(conversation_id, role, text)
+                except (DatabaseMigrationError, OSError, RuntimeError) as exc:
+                    log.error("Failed to append message to conversation: %s", exc)
             publish("message", role=role, text=text)
 
     async def start_voice(
@@ -288,6 +371,7 @@ async def session(websocket: WebSocket):
         conversation_id: str | None = None,
         initial_text: str | None = None,
         initial_speak_text: str | None = None,
+        ephemeral: bool = False,
     ) -> None:
         global active_session_stop
         nonlocal voice_task, output_task, conversation
@@ -305,101 +389,29 @@ async def session(websocket: WebSocket):
                 return
         active_session_stop = stop_voice
 
-        db_status = ensure_database_ready(websocket.app)
-        if db_status.get("status") == "error":
-            publish(
-                "error",
-                message_key="db_migration_failed",
-                code="DATABASE_MIGRATION_FAILED",
-                message=db_status.get(
-                    "message_zh",
-                    "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
-                ),
-                message_en=db_status.get(
-                    "message_en",
-                    "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
-                ),
-                recovery=db_status.get("recovery", "python -m openvoicechat.migrate"),
-                detail=db_status.get("error"),
-            )
-            publish("state", state="idle")
-            return
-
-        try:
-            saved_conversation = get_conversation(conversation_id) if conversation_id else None
-            if conversation_id and saved_conversation is None:
-                publish("error", message_key="history_missing")
+        if not ephemeral:
+            db_status = ensure_database_ready(websocket.app)
+            if db_status.get("status") == "error":
+                publish(
+                    "error",
+                    message_key="db_migration_failed",
+                    code="DATABASE_MIGRATION_FAILED",
+                    message=db_status.get(
+                        "message_zh",
+                        "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+                    ),
+                    message_en=db_status.get(
+                        "message_en",
+                        "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+                    ),
+                    recovery=db_status.get("recovery", "python -m openvoicechat.migrate"),
+                    detail=db_status.get("error"),
+                )
                 publish("state", state="idle")
                 return
 
-            if saved_conversation is not None:
-                hist_char_id = saved_conversation.get("character_id")
-                hist_voice = saved_conversation.get("voice")
-                hist_engine = saved_conversation.get("tts_engine")
-
-                # Check if user explicitly changed character
-                if character_id is not None and character_id != hist_char_id:
-                    chosen_char_id = character_id
-                    char_changed = True
-                else:
-                    chosen_char_id = hist_char_id
-                    char_changed = False
-
-                char = None
-                if chosen_char_id:
-                    try:
-                        char = CharacterConfig.from_file(chosen_char_id)
-                    except (OSError, ValueError, TypeError, AttributeError, FileNotFoundError) as exc:
-                        log.warning("Failed to load character %s: %s", chosen_char_id, exc)
-
-                if char is None:
-                    char = get_default_character()
-                    publish("notice", message_key="char_deleted_fallback", name=char.name)
-                    chosen_char_id = char.name.lower() or "mio"
-                    char_changed = True
-
-                # Check engine
-                if (
-                    engine_override is not None
-                    and hist_engine is not None
-                    and engine_override != hist_engine
-                ):
-                    chosen_engine = engine_override
-                    engine_changed = True
-                elif hist_engine:
-                    chosen_engine = hist_engine
-                    engine_changed = False
-                else:
-                    chosen_engine = engine_override or char.tts_engine or "gpt_sovits"
-                    publish("notice", message_key="legacy_settings_fallback")
-                    engine_changed = True
-
-                # Check voice
-                if (
-                    voice_override is not None
-                    and hist_voice is not None
-                    and voice_override != hist_voice
-                ):
-                    chosen_voice = voice_override
-                    voice_changed = True
-                elif hist_voice:
-                    chosen_voice = hist_voice
-                    voice_changed = False
-                else:
-                    chosen_voice = voice_override or char.voice or TTS_VOICE
-                    if not engine_changed:
-                        publish("notice", message_key="legacy_settings_fallback")
-                    voice_changed = True
-
-                if char_changed or engine_changed or voice_changed:
-                    update_conversation_settings(
-                        saved_conversation["id"],
-                        character_id=chosen_char_id,
-                        character_name=char.name,
-                        voice=chosen_voice,
-                        tts_engine=chosen_engine,
-                    )
-            else:
+        try:
+            if ephemeral:
                 char = None
                 if character_id:
                     try:
@@ -408,19 +420,108 @@ async def session(websocket: WebSocket):
                         log.warning("Failed to load character %s: %s", character_id, exc)
                 if char is None:
                     char = get_default_character()
-
                 chosen_voice = voice_override or char.voice or TTS_VOICE
                 chosen_engine = engine_override or char.tts_engine or "gpt_sovits"
                 chosen_char_id = character_id or "mio"
-                saved_conversation = create_conversation(
-                    chosen_char_id,
-                    char.name,
-                    voice=chosen_voice,
-                    tts_engine=chosen_engine,
-                )
+                saved_conversation = {"id": None, "messages": [], "summary": None}
+                session_conversation_id = None
+                publish("conversation", id=None, ephemeral=True)
+            else:
+                saved_conversation = get_conversation(conversation_id) if conversation_id else None
+                if conversation_id and saved_conversation is None:
+                    publish("error", message_key="history_missing")
+                    publish("state", state="idle")
+                    return
 
-            session_conversation_id = saved_conversation["id"]
-            publish("conversation", id=session_conversation_id)
+                if saved_conversation is not None:
+                    hist_char_id = saved_conversation.get("character_id")
+                    hist_voice = saved_conversation.get("voice")
+                    hist_engine = saved_conversation.get("tts_engine")
+
+                    # Check if user explicitly changed character
+                    if character_id is not None and character_id != hist_char_id:
+                        chosen_char_id = character_id
+                        char_changed = True
+                    else:
+                        chosen_char_id = hist_char_id
+                        char_changed = False
+
+                    char = None
+                    if chosen_char_id:
+                        try:
+                            char = CharacterConfig.from_file(chosen_char_id)
+                        except (OSError, ValueError, TypeError, AttributeError, FileNotFoundError) as exc:
+                            log.warning("Failed to load character %s: %s", chosen_char_id, exc)
+
+                    if char is None:
+                        char = get_default_character()
+                        publish("notice", message_key="char_deleted_fallback", name=char.name)
+                        chosen_char_id = char.name.lower() or "mio"
+                        char_changed = True
+
+                    # Check engine
+                    if (
+                        engine_override is not None
+                        and hist_engine is not None
+                        and engine_override != hist_engine
+                    ):
+                        chosen_engine = engine_override
+                        engine_changed = True
+                    elif hist_engine:
+                        chosen_engine = hist_engine
+                        engine_changed = False
+                    else:
+                        chosen_engine = engine_override or char.tts_engine or "gpt_sovits"
+                        publish("notice", message_key="legacy_settings_fallback")
+                        engine_changed = True
+
+                    # Check voice
+                    if (
+                        voice_override is not None
+                        and hist_voice is not None
+                        and voice_override != hist_voice
+                    ):
+                        chosen_voice = voice_override
+                        voice_changed = True
+                    elif hist_voice:
+                        chosen_voice = hist_voice
+                        voice_changed = False
+                    else:
+                        chosen_voice = voice_override or char.voice or TTS_VOICE
+                        if not engine_changed:
+                            publish("notice", message_key="legacy_settings_fallback")
+                        voice_changed = True
+
+                    if char_changed or engine_changed or voice_changed:
+                        update_conversation_settings(
+                            saved_conversation["id"],
+                            character_id=chosen_char_id,
+                            character_name=char.name,
+                            voice=chosen_voice,
+                            tts_engine=chosen_engine,
+                        )
+                else:
+                    char = None
+                    if character_id:
+                        try:
+                            char = CharacterConfig.from_file(character_id)
+                        except (OSError, ValueError, TypeError, AttributeError, FileNotFoundError) as exc:
+                            log.warning("Failed to load character %s: %s", character_id, exc)
+                    if char is None:
+                        char = get_default_character()
+
+                    chosen_voice = voice_override or char.voice or TTS_VOICE
+                    chosen_engine = engine_override or char.tts_engine or "gpt_sovits"
+                    chosen_char_id = character_id or "mio"
+                    saved_conversation = create_conversation(
+                        chosen_char_id,
+                        char.name,
+                        voice=chosen_voice,
+                        tts_engine=chosen_engine,
+                    )
+
+                session_conversation_id = saved_conversation["id"]
+                publish("conversation", id=session_conversation_id, ephemeral=False)
         except (OSError, RuntimeError, sqlite3.Error) as exc:
             log.error("Failed to access or initialize conversation: %s", exc)
             publish(
@@ -459,19 +560,30 @@ async def session(websocket: WebSocket):
                         tts_engine=chosen_engine,
                     )
                     try:
+                        log_full_text = (
+                            False
+                            if ephemeral
+                            else (
+                                getattr(websocket.app.state, "log_full_text", False)
+                                or (os.environ.get("OVC_LOG_FULL_TEXT", "").lower() in ("1", "true", "yes", "on"))
+                            )
+                        )
                         conversation = Conversation(
                             speech,
                             config=config,
                             system_prompt=chosen_prompt,
                             history=saved_conversation.get("messages", []),
                             summary=saved_conversation.get("summary"),
-                            on_turn=lambda role, text: on_turn(session_conversation_id, role, text),
-                            on_summary=lambda text: update_conversation_summary(
-                                session_conversation_id, text
+                            on_turn=lambda role, text: on_turn(
+                                session_conversation_id, role, text, is_ephemeral=ephemeral
+                            ),
+                            on_summary=None if ephemeral else (
+                                lambda text: update_conversation_summary(session_conversation_id, text)
                             ),
                             on_event=publish,
                             verbose=True,
                             speaker_mode=not barge_in,
+                            log_full_text=log_full_text,
                         )
                         output_task = asyncio.create_task(forward_audio_output(conversation))
                         publish("state", state="running")
@@ -566,6 +678,7 @@ async def session(websocket: WebSocket):
                     selected_conversation = command.get("conversation_id")
                     if not isinstance(selected_conversation, str):
                         selected_conversation = None
+                    ephemeral = bool(command.get("ephemeral", False) or command.get("save_history") is False)
                     initial_text = command.get("text")
                     if not isinstance(initial_text, str) or not initial_text.strip():
                         initial_text = None
@@ -578,8 +691,10 @@ async def session(websocket: WebSocket):
                         engine_override=e_override,
                         conversation_id=selected_conversation,
                         initial_text=initial_text,
+                        ephemeral=ephemeral,
                     )
                 elif action == "text":
+                    ephemeral = bool(command.get("ephemeral", False) or command.get("save_history") is False)
                     text_content = command.get("text")
                     if isinstance(text_content, str) and text_content.strip():
                         text_content = text_content.strip()
@@ -605,8 +720,10 @@ async def session(websocket: WebSocket):
                                 engine_override=e_override,
                                 conversation_id=selected_conversation,
                                 initial_text=text_content,
+                                ephemeral=ephemeral,
                             )
                 elif action == "retry_speak":
+                    ephemeral = bool(command.get("ephemeral", False) or command.get("save_history") is False)
                     text_content = command.get("text")
                     if isinstance(text_content, str) and text_content.strip():
                         text_content = text_content.strip()
@@ -630,6 +747,7 @@ async def session(websocket: WebSocket):
                             engine_override=e_override,
                             conversation_id=selected_conversation,
                             initial_speak_text=text_content,
+                            ephemeral=ephemeral,
                         )
                 elif action == "playback_started":
                     if conversation is not None:
@@ -659,6 +777,13 @@ if __name__ == "__main__":
         default=TTS_SAMPLE_STEPS,
         help="GPT-SoVITS v4 sampling steps",
     )
+    parser.add_argument(
+        "--log-full-text",
+        action="store_true",
+        default=False,
+        help="Log full text of transcripts and replies (default: compact stages and durations only)",
+    )
     args = parser.parse_args()
     app.state.tts_steps = args.tts_steps
+    app.state.log_full_text = args.log_full_text
     uvicorn.run(app, host="127.0.0.1", port=args.port)
