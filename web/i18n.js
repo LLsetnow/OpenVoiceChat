@@ -88,6 +88,13 @@
       user_name: "你",
       assistant_default_name: "千夏",
 
+     // 文本输入
+     text_input_placeholder: "输入文字向{name}提问…（Enter 发送）",
+     text_input_aria: "文字输入框",
+     send_text_button: "发送",
+     send_text_title: "发送文字（Enter）",
+     metric_text_input: "文字输入",
+
       // 耗时监控
       timing_title: "本轮耗时",
       metric_asr: "语音识别",
@@ -216,6 +223,13 @@
       user_name: "You",
       assistant_default_name: "Chinatsu",
 
+     // Text input
+     text_input_placeholder: "Type a message to {name}... (Enter to send)",
+     text_input_aria: "Text input box",
+     send_text_button: "Send",
+     send_text_title: "Send message (Enter)",
+     metric_text_input: "Text input",
+
       // Timings
       timing_title: "Turn Latency",
       metric_asr: "Speech Recognition",
@@ -303,6 +317,9 @@
     for (const node of root.querySelectorAll("[data-i18n-title]")) {
       node.setAttribute("title", translate(node.dataset.i18nTitle));
     }
+   for (const node of root.querySelectorAll("[data-i18n-placeholder]")) {
+     node.setAttribute("placeholder", translate(node.dataset.i18nPlaceholder));
+   }
   }
 
   function setLocale(nextLocale) {

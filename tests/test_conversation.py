@@ -169,3 +169,19 @@ async def test_interrupt_cancels_turn_and_drains_output():
     assert conv._turn_task is None
     assert conv.output.empty()
     assert conv.agent_speaking is False
+
+
+async def test_send_text_produces_audio_and_turn():
+    events = []
+    conv = make_conversation(events)
+    run_task = asyncio.create_task(conv.run())
+
+    await conv.send_text("Hello from text")
+    chunk = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert len(chunk) == 3200
+
+    await wait_for_role(events, "assistant")
+    assert ("user", "Hello from text") in events
+    assert ("assistant", "Hi there.") in events
+
+    await stop(conv, run_task)

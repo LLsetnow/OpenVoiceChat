@@ -176,6 +176,7 @@ async def session(websocket: WebSocket):
         voice_override: str | None = None,
         engine_override: str | None = None,
         conversation_id: str | None = None,
+       initial_text: str | None = None,
     ) -> None:
         global active_session_stop
         nonlocal voice_task, output_task, conversation
@@ -246,6 +247,8 @@ async def session(websocket: WebSocket):
                         )
                         output_task = asyncio.create_task(forward_audio_output(conversation))
                         publish("state", state="running")
+                        if initial_text:
+                            await conversation.send_text(initial_text)
                         try:
                             await conversation.run()
                         finally:
@@ -316,13 +319,42 @@ async def session(websocket: WebSocket):
                     selected_conversation = command.get("conversation_id")
                     if not isinstance(selected_conversation, str):
                         selected_conversation = None
+                    initial_text = command.get("text")
+                    if not isinstance(initial_text, str) or not initial_text.strip():
+                        initial_text = None
+                    else:
+                        initial_text = initial_text.strip()
                     await start_voice(
                         barge_in,
                         character_id=char_id,
                         voice_override=v_override,
                         engine_override=e_override,
                         conversation_id=selected_conversation,
+                        initial_text=initial_text,
                     )
+                elif action == "text":
+                    text_content = command.get("text")
+                    if isinstance(text_content, str) and text_content.strip():
+                        text_content = text_content.strip()
+                        if conversation is not None and not conversation._stop.is_set():
+                            await conversation.send_text(text_content)
+                        elif voice_task is None or voice_task.done():
+                            mode = command.get("mode")
+                            barge_in = mode == "barge_in" if mode in ("speaker", "barge_in") else command.get("barge_in", False)
+                            char_id = command.get("character")
+                            v_override = command.get("voice")
+                            e_override = command.get("tts_engine")
+                            selected_conversation = command.get("conversation_id")
+                            if not isinstance(selected_conversation, str):
+                                selected_conversation = None
+                            await start_voice(
+                                barge_in,
+                                character_id=char_id,
+                                voice_override=v_override,
+                                engine_override=e_override,
+                                conversation_id=selected_conversation,
+                                initial_text=text_content,
+                            )
                 elif action == "playback_started":
                     if conversation is not None:
                         conversation.agent_speaking = True
