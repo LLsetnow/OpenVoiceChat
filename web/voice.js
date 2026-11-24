@@ -283,7 +283,15 @@ async function refreshConversationList() {
   if (!historyList) return;
   try {
     const response = await fetch(`${apiBase}/api/conversations`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      let errDetail = null;
+      try {
+        errDetail = await response.json();
+      } catch {}
+      const err = new Error(`HTTP ${response.status}`);
+      err.detail = errDetail;
+      throw err;
+    }
     const data = await response.json();
     conversationData = data.conversations || [];
     historyList.replaceChildren();
@@ -324,7 +332,15 @@ async function refreshConversationList() {
     historyList.replaceChildren();
     const empty = document.createElement("p");
     empty.className = "history-empty";
-    empty.textContent = t("history_unavailable");
+    const detailObj = err?.detail?.detail || err?.detail;
+    const msgKey = detailObj?.message_key;
+    if (msgKey) {
+      const translated = t(msgKey);
+      empty.textContent = translated;
+      notice(translated);
+    } else {
+      empty.textContent = t("history_unavailable");
+    }
     historyList.appendChild(empty);
   }
 }
@@ -892,7 +908,16 @@ function onEvent(event) {
       deviceError = event.message;
       updateControls();
       break;
-    case "error": notice(event.message || (event.message_key ? t(event.message_key) : "")); finishDrafts(); phase(""); break;
+    case "error": {
+      let msg = event.message_key ? t(event.message_key, event) : "";
+      if (!msg || msg === event.message_key) {
+        msg = (window.ovcI18n?.locale === "en" && event.message_en) ? event.message_en : (event.message || "");
+      }
+      notice(msg);
+      finishDrafts();
+      phase("");
+      break;
+    }
     case "tts_error":
       notice(event.message || (event.message_key ? t(event.message_key) : t("tts_error_notice")));
       phase(t("phase_tts_error"), "tts");

@@ -87,7 +87,7 @@ else
   PORT=18768
   URL="http://127.0.0.1:$PORT"
 
-  .venv/bin/python -m openvoicechat.migrate || fail "初始化本地对话记录数据库失败。"
+  .venv/bin/python -m openvoicechat.migrate || fail "初始化本地对话记录数据库失败。请检查 data/ 目录写入权限并运行：.venv/bin/python -m openvoicechat.migrate 手动恢复。"
 
   # 检查端口是否已被占用
   if lsof -i :$PORT >/dev/null 2>&1; then
