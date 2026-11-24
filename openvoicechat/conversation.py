@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import time
+import uuid
 from collections import deque
 
 import pysbd
@@ -127,6 +128,7 @@ class Conversation:
         self.input: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
         self.output: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=100)
         self.agent_speaking = False
+        self._current_turn_id: str | None = None
         self.messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
         self.messages.extend(
             {"role": item["role"], "content": item["content"]}
@@ -370,9 +372,12 @@ class Conversation:
 
     async def _speak_reply(self, text: str) -> None:
         """Synthesize and stream audio chunks for an existing reply text."""
+        turn_id = uuid.uuid4().hex[:8]
+        self._current_turn_id = turn_id
+        self._event("turn_start", turn_id=turn_id, input_type="retry_speak")
         spoken: list[str] = []
         sentences: asyncio.Queue[str | None] = asyncio.Queue(maxsize=16)
-        tts_task = asyncio.create_task(self._speak(sentences, spoken, 0.0))
+        tts_task = asyncio.create_task(self._speak(sentences, spoken, 0.0, turn_id=turn_id))
         tts_error: Exception | None = None
         try:
             parts = _split_sentences(text)
@@ -416,6 +421,9 @@ class Conversation:
         *,
         text: str | None = None,
     ) -> None:
+        turn_id = uuid.uuid4().hex[:8]
+        self._current_turn_id = turn_id
+        self._event("turn_start", turn_id=turn_id, input_type="voice" if text is None else "text")
         spoken: list[str] = []
         sentences: asyncio.Queue[str | None] = asyncio.Queue(maxsize=16)
         tts_task: asyncio.Task | None = None
@@ -434,10 +442,10 @@ class Conversation:
                 text = text.strip()
                 asr_ms = round(1000 * (time.monotonic() - stt_started))
                 self._log(f"STT ({asr_ms}ms): {text!r}")
-                self._event("timing", stage="asr", milliseconds=asr_ms)
+                self._event("timing", stage="asr", milliseconds=asr_ms, turn_id=turn_id)
             else:
                 text = text.strip()
-                self._event("timing", stage="asr", milliseconds=0)
+                self._event("timing", stage="asr", milliseconds=0, turn_id=turn_id)
             if not text:
                 self.agent_speaking = False
                 self.input_paused = False
@@ -451,7 +459,7 @@ class Conversation:
             segmenter = pysbd.Segmenter(language="en", clean=False)
             buffer = ""
             llm_started = time.monotonic()
-            tts_task = asyncio.create_task(self._speak(sentences, spoken, llm_started))
+            tts_task = asyncio.create_task(self._speak(sentences, spoken, llm_started, turn_id=turn_id))
             first_token = True
             first_clause = self.config.speak_first_clause
             request_options = (
@@ -472,7 +480,7 @@ class Conversation:
                         first_token = False
                         first_ms = round(1000 * (time.monotonic() - llm_started))
                         self._log(f"LLM first token ({first_ms}ms)")
-                        self._event("timing", stage="llm_first", milliseconds=first_ms)
+                        self._event("timing", stage="llm_first", milliseconds=first_ms, turn_id=turn_id)
                     response += token
                     self._event("assistant_partial", text=response)
                     buffer += token
@@ -567,7 +575,13 @@ class Conversation:
             with contextlib.suppress(asyncio.QueueFull):
                 self.input.put_nowait(b"")
 
-    async def _speak(self, sentences: asyncio.Queue, spoken: list[str], llm_started: float = 0.0) -> None:
+    async def _speak(
+        self,
+        sentences: asyncio.Queue,
+        spoken: list[str],
+        llm_started: float = 0.0,
+        turn_id: str | None = None,
+    ) -> None:
         first_segment = True
         while True:
             sentence = await sentences.get()
@@ -577,13 +591,17 @@ class Conversation:
             if first_segment:
                 if llm_started > 0:
                     self._event(
-                        "timing", stage="llm", milliseconds=round(1000 * (tts_started - llm_started))
+                        "timing",
+                        stage="llm",
+                        milliseconds=round(1000 * (tts_started - llm_started)),
+                        turn_id=turn_id,
                     )
-                self._event("tts_start")
+                self._event("tts_start", turn_id=turn_id)
             audio = await self.speech.synthesize(sentence)
             tts_ms = round(1000 * (time.monotonic() - tts_started))
             if first_segment:
-                self._event("timing", stage="tts", milliseconds=tts_ms)
+                self._event("timing", stage="tts", milliseconds=tts_ms, turn_id=turn_id)
+                self._event("first_audio_ready", turn_id=turn_id, tts_ms=tts_ms)
                 first_segment = False
             self._log(f"TTS ({tts_ms}ms, {len(audio)} bytes): {sentence!r}")
             if not audio:
@@ -615,6 +633,7 @@ class Conversation:
         return False
 
     async def _interrupt(self) -> None:
+        t0 = time.monotonic()
         self._log(f"barge-in | cancelling turn, output_chunks={self.output.qsize()}")
         task, self._turn_task = self._turn_task, None
         self.agent_speaking = False
@@ -623,10 +642,16 @@ class Conversation:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         await self._close_asr()
-        _drain(self.output)
+        cleared_chunks = _drain(self.output)
         self.input_paused = False
         self._event("mic_paused", paused=False)
-        self._event("interrupted")
+        duration_ms = max(1, round(1000 * (time.monotonic() - t0)))
+        self._event(
+            "interrupted",
+            duration_ms=duration_ms,
+            cleared_chunks=cleared_chunks,
+            turn_id=self._current_turn_id,
+        )
 
     async def _close_asr(self) -> None:
         task, self._asr_task = self._asr_task, None
@@ -746,12 +771,14 @@ def _take_first_clause(buffer: str) -> tuple[str, str] | None:
     return None
 
 
-def _drain(queue: asyncio.Queue) -> None:
+def _drain(queue: asyncio.Queue) -> int:
+    count = 0
     while True:
         try:
             queue.get_nowait()
+            count += 1
         except asyncio.QueueEmpty:
-            return
+            return count
 
 
 async def _read_frames(queue: asyncio.Queue[bytes | None]):

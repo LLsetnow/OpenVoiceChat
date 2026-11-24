@@ -52,6 +52,12 @@
                 <option value="cosyvoice" data-i18n="engine_cosyvoice">阿里云 CosyVoice</option>
               </select>
             </label>
+            <label for="tts-steps-select" id="tts-steps-row"><span data-i18n="tts_steps_select_label">推理步数:</span>
+              <select id="tts-steps-select">
+                <option value="8" selected data-i18n="steps_8">8 步 (默认高音质)</option>
+                <option value="4" data-i18n="steps_4">4 步 (极速低延迟)</option>
+              </select>
+            </label>
             <label for="voice-select"><span data-i18n="voice_select_label">音色:</span>
               <select id="voice-select">
                 <option value="chinatsu" selected data-i18n="voice_chinatsu">千夏 (chinatsu)</option>
@@ -155,6 +161,21 @@
             <dt><span>TTS</span> <span data-i18n="metric_tts">合成首段</span></dt>
             <dd id="tts">—</dd>
             <dd class="metric-hint" id="tts-sub" data-i18n="metric_tts_sub">GPT-SoVITS · 千夏</dd>
+          </div>
+          <div class="metric" id="net-row">
+            <dt><span>NET</span> <span data-i18n="metric_network">网络排队</span></dt>
+            <dd id="net">—</dd>
+            <dd class="metric-hint" data-i18n="metric_network_hint">传输与调度等待</dd>
+          </div>
+          <div class="metric" id="playback-row">
+            <dt><span>PLAY</span> <span data-i18n="metric_playback">首段播放</span></dt>
+            <dd id="playback">—</dd>
+            <dd class="metric-hint" id="playback-sub" data-i18n="metric_playback_hint">端到端真实开始发声</dd>
+          </div>
+          <div class="metric" id="interrupt-row" hidden>
+            <dt><span>INT</span> <span data-i18n="metric_interrupt">插话停止</span></dt>
+            <dd id="interrupt">—</dd>
+            <dd class="metric-hint" data-i18n="metric_interrupt_hint">打断响应与音轨清空</dd>
           </div>
         </dl>
       </aside>

@@ -6,7 +6,9 @@ import contextlib
 import json
 import logging
 import sqlite3
+import time
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -18,6 +20,7 @@ from starlette.websockets import WebSocketDisconnected
 
 from openvoicechat.aliyun_sovits import TTS_SAMPLE_STEPS, TTS_VOICE
 from openvoicechat.audio import SPEECH_FRAME_BYTES, audio_devices
+from openvoicechat.benchmark import calculate_statistics, collect_environment_info
 from openvoicechat.character import CharacterConfig, get_default_character, list_characters
 from openvoicechat.conversation import Conversation
 from openvoicechat.history import (
@@ -36,6 +39,64 @@ PORT = 18768
 log = logging.getLogger(__name__)
 audio_in_use = asyncio.Lock()
 active_session_stop = None
+
+
+def record_turn_event(
+    target_app: FastAPI, kind: str, engine: str, steps: int, **data: Any
+) -> None:
+    metrics = getattr(target_app.state, "turn_metrics", None)
+    if metrics is None:
+        metrics = []
+        target_app.state.turn_metrics = metrics
+
+    if kind == "turn_start":
+        turn_id = data.get("turn_id")
+        rec = {
+            "turn_id": turn_id,
+            "timestamp": time.time(),
+            "input_type": data.get("input_type", "voice"),
+            "status": "pending",
+            "asr_ms": None,
+            "llm_first_ms": None,
+            "llm_ms": None,
+            "tts_ms": None,
+            "network_queue_ms": None,
+            "playback_latency_ms": None,
+            "interruption_latency_ms": None,
+            "tts_engine": engine,
+            "tts_steps": steps,
+        }
+        metrics.append(rec)
+        if len(metrics) > 100:
+            del metrics[: len(metrics) - 100]
+    elif kind == "timing":
+        turn_id = data.get("turn_id")
+        stage = data.get("stage")
+        ms = data.get("milliseconds")
+        rec = next((r for r in reversed(metrics) if r.get("turn_id") == turn_id), None)
+        if rec and ms is not None:
+            if stage == "asr":
+                rec["asr_ms"] = float(ms)
+            elif stage == "llm_first":
+                rec["llm_first_ms"] = float(ms)
+            elif stage == "llm":
+                rec["llm_ms"] = float(ms)
+            elif stage == "tts":
+                rec["tts_ms"] = float(ms)
+    elif kind == "interrupted":
+        turn_id = data.get("turn_id")
+        dur = data.get("duration_ms")
+        rec = next((r for r in reversed(metrics) if r.get("turn_id") == turn_id), None)
+        if rec:
+            rec["status"] = "interrupted"
+            if dur is not None:
+                rec["interruption_latency_ms"] = float(dur)
+    elif kind == "output_complete":
+        if metrics and metrics[-1].get("status") == "pending":
+            metrics[-1]["status"] = "completed"
+    elif kind == "error" and metrics:
+        metrics[-1]["status"] = "failed"
+
 
 def run_startup_migrations(target_app: FastAPI) -> dict:
     try:
@@ -90,6 +151,7 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
 app.state.tts_steps = TTS_SAMPLE_STEPS
 app.state.database_status = None
 app.state.migration_error = None
+app.state.turn_metrics = []
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 app.add_middleware(
     CORSMiddleware,
@@ -119,6 +181,46 @@ async def api_status():
     return {
         "status": "ready" if status.get("status") == "ready" else "degraded",
         "database": status,
+        "diagnostics": "/api/diagnostics/latency",
+    }
+
+
+@app.get("/api/diagnostics/latency")
+async def api_diagnostics_latency():
+    records = getattr(app.state, "turn_metrics", [])
+    completed_records = [r for r in records if r.get("status") == "completed"]
+
+    def get_stat(key: str) -> dict:
+        vals = [r[key] for r in completed_records if r.get(key) is not None]
+        return calculate_statistics(vals)
+
+    summary = {
+        "total_turns": len(records),
+        "completed_turns": len(completed_records),
+        "cancelled_turns": len([r for r in records if r.get("status") == "cancelled"]),
+        "failed_turns": len([r for r in records if r.get("status") == "failed"]),
+        "interrupted_turns": len([r for r in records if r.get("status") == "interrupted"]),
+        "metrics": {
+            "asr_ms": get_stat("asr_ms"),
+            "llm_first_ms": get_stat("llm_first_ms"),
+            "llm_ms": get_stat("llm_ms"),
+            "tts_ms": get_stat("tts_ms"),
+            "network_queue_ms": get_stat("network_queue_ms"),
+            "playback_latency_ms": get_stat("playback_latency_ms"),
+            "interruption_latency_ms": calculate_statistics(
+                [
+                    r["interruption_latency_ms"]
+                    for r in records
+                    if r.get("interruption_latency_ms") is not None
+                ]
+            ),
+        },
+    }
+    return {
+        "status": "ok",
+        "environment": collect_environment_info(),
+        "summary": summary,
+        "recent_turns": records[-30:],
     }
 
 
@@ -244,6 +346,7 @@ async def session(websocket: WebSocket):
             while True:
                 pcm = await conv.output.get()
                 if pcm is None:
+                    record_turn_event(websocket.app, "output_complete", "", 0)
                     publish("output_complete")
                     continue
                 await safe_send_bytes(pcm)
@@ -285,6 +388,7 @@ async def session(websocket: WebSocket):
         character_id: str | None = None,
         voice_override: str | None = None,
         engine_override: str | None = None,
+        steps_override: int | None = None,
         conversation_id: str | None = None,
         initial_text: str | None = None,
         initial_speak_text: str | None = None,
@@ -451,14 +555,23 @@ async def session(websocket: WebSocket):
             try:
                 async with audio_in_use:
                     publish("state", state="starting")
+                    chosen_steps = (
+                        steps_override
+                        if isinstance(steps_override, int) and steps_override in (4, 8)
+                        else websocket.app.state.tts_steps
+                    )
                     config, speech = voice_profile(
                         voice=chosen_voice,
                         language="zh",
                         on_partial=lambda text: publish("user_partial", text=text),
-                        tts_steps=websocket.app.state.tts_steps,
+                        tts_steps=chosen_steps,
                         tts_engine=chosen_engine,
                     )
                     try:
+                        def on_conversation_event(kind: str, **data: Any):
+                            record_turn_event(websocket.app, kind, chosen_engine, chosen_steps, **data)
+                            publish(kind, **data)
+
                         conversation = Conversation(
                             speech,
                             config=config,
@@ -469,7 +582,7 @@ async def session(websocket: WebSocket):
                             on_summary=lambda text: update_conversation_summary(
                                 session_conversation_id, text
                             ),
-                            on_event=publish,
+                            on_event=on_conversation_event,
                             verbose=True,
                             speaker_mode=not barge_in,
                         )
@@ -563,6 +676,9 @@ async def session(websocket: WebSocket):
                     char_id = command.get("character")
                     v_override = command.get("voice")
                     e_override = command.get("tts_engine")
+                    s_override = command.get("tts_steps")
+                    if not isinstance(s_override, int) or s_override not in (4, 8):
+                        s_override = None
                     selected_conversation = command.get("conversation_id")
                     if not isinstance(selected_conversation, str):
                         selected_conversation = None
@@ -576,6 +692,7 @@ async def session(websocket: WebSocket):
                         character_id=char_id,
                         voice_override=v_override,
                         engine_override=e_override,
+                        steps_override=s_override,
                         conversation_id=selected_conversation,
                         initial_text=initial_text,
                     )
@@ -595,6 +712,9 @@ async def session(websocket: WebSocket):
                             char_id = command.get("character")
                             v_override = command.get("voice")
                             e_override = command.get("tts_engine")
+                            s_override = command.get("tts_steps")
+                            if not isinstance(s_override, int) or s_override not in (4, 8):
+                                s_override = None
                             selected_conversation = command.get("conversation_id")
                             if not isinstance(selected_conversation, str):
                                 selected_conversation = None
@@ -603,6 +723,7 @@ async def session(websocket: WebSocket):
                                 character_id=char_id,
                                 voice_override=v_override,
                                 engine_override=e_override,
+                                steps_override=s_override,
                                 conversation_id=selected_conversation,
                                 initial_text=text_content,
                             )
@@ -620,6 +741,9 @@ async def session(websocket: WebSocket):
                         char_id = command.get("character")
                         v_override = command.get("voice")
                         e_override = command.get("tts_engine")
+                        s_override = command.get("tts_steps")
+                        if not isinstance(s_override, int) or s_override not in (4, 8):
+                            s_override = None
                         selected_conversation = command.get("conversation_id")
                         if not isinstance(selected_conversation, str):
                             selected_conversation = None
@@ -628,12 +752,38 @@ async def session(websocket: WebSocket):
                             character_id=char_id,
                             voice_override=v_override,
                             engine_override=e_override,
+                            steps_override=s_override,
                             conversation_id=selected_conversation,
                             initial_speak_text=text_content,
                         )
                 elif action == "playback_started":
                     if conversation is not None:
                         conversation.agent_speaking = True
+                    turn_id = command.get("turn_id")
+                    play_ms = command.get("playback_latency_ms")
+                    net_ms = command.get("network_queue_ms")
+                    metrics = getattr(websocket.app.state, "turn_metrics", [])
+                    rec = next((r for r in reversed(metrics) if r.get("turn_id") == turn_id), None)
+                    if rec is None and metrics:
+                        rec = metrics[-1]
+                    if rec:
+                        if play_ms is not None:
+                            rec["playback_latency_ms"] = float(play_ms)
+                        if net_ms is not None:
+                            rec["network_queue_ms"] = float(net_ms)
+                        if rec.get("status") == "pending":
+                            rec["status"] = "completed"
+                elif action == "interrupted_metric":
+                    turn_id = command.get("turn_id")
+                    int_ms = command.get("interruption_latency_ms")
+                    metrics = getattr(websocket.app.state, "turn_metrics", [])
+                    rec = next((r for r in reversed(metrics) if r.get("turn_id") == turn_id), None)
+                    if rec is None and metrics:
+                        rec = metrics[-1]
+                    if rec:
+                        rec["status"] = "interrupted"
+                        if int_ms is not None:
+                            rec["interruption_latency_ms"] = float(int_ms)
                 elif action == "playback_ended":
                     if conversation is not None:
                         conversation.notify_playback_ended()
