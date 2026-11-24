@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f3f5ef">
   <title>语音对话 · OpenVoiceChat</title>
-  <link rel="stylesheet" href="assets/voice.css?v=1.2.0">
-  <script src="assets/i18n.js?v=1.2.1" defer></script>
-  <script src="assets/voice.js?v=1.3.1" defer></script>
+  <link rel="stylesheet" href="assets/voice.css?v=1.2.1">
+  <script src="assets/i18n.js?v=1.2.2" defer></script>
+  <script src="assets/voice.js?v=1.3.2" defer></script>
 </head>
 <body>
   <div class="page">
@@ -21,9 +21,15 @@
         <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
         OpenVoiceChat
       </div>
-      <p class="session-state" id="session-state" data-state="connecting" role="status">
-        <span class="state-dot" aria-hidden="true"></span><span id="state-label" data-i18n="state_connecting">正在连接</span>
-      </p>
+      <div class="topbar-actions">
+        <button id="lang-toggle" class="lang-toggle" type="button" aria-label="切换为英文" data-i18n-aria-label="lang_toggle_aria">
+          <span class="lang-icon" aria-hidden="true">文/A</span>
+          <span id="lang-label" data-i18n="lang_switch_label">English</span>
+        </button>
+        <p class="session-state" id="session-state" data-state="connecting" role="status">
+          <span class="state-dot" aria-hidden="true"></span><span id="state-label" data-i18n="state_connecting">正在连接</span>
+        </p>
+      </div>
     </header>
 
     <section class="intro" aria-labelledby="page-title">
