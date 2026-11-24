@@ -36,6 +36,8 @@ dependencies = [
 [project.optional-dependencies]
 # Microphone and speaker I/O.
 local = ["sounddevice>=0.5"]
+aliyun = ["sounddevice>=0.5", "httpx>=0.27", "websockets>=15"]
+web = ["fastapi>=0.110", "uvicorn>=0.29"]
 # Local Parakeet STT and Kokoro TTS.
 models = [
     "torch>=2.4",
@@ -57,11 +59,14 @@ dev = [
 ovc = "openvoicechat.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/fakhirali/OpenVoiceChat"
-Issues = "https://github.com/fakhirali/OpenVoiceChat/issues"
+Homepage = "https://github.com/LLsetnow/OpenVoiceChat"
+Issues = "https://github.com/LLsetnow/OpenVoiceChat/issues"
 
 [tool.setuptools.packages.find]
 include = ["openvoicechat*"]
+
+[tool.setuptools.package-data]
+openvoicechat = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

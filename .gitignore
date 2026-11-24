@@ -12,6 +12,10 @@ venv/
 data/
 .pytest_cache/
 .ruff_cache/
+.DS_Store
+*.log
+*.app/
+characters/mio.json
 
 # Private notes and reviews
 notes/

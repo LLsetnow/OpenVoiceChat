@@ -9,9 +9,9 @@ else is a plain dataclass field, set in code or overridden per instance:
 import os
 from dataclasses import dataclass, field
 
-from dotenv import find_dotenv, load_dotenv
+from dotenv import load_dotenv
 
-load_dotenv(find_dotenv(usecwd=True))
+load_dotenv(".env")
 
 DEFAULT_LLM_BASE_URL = ""  # empty means https://api.openai.com/v1
 DEFAULT_LLM_MODEL = "gpt-6-luna"
@@ -45,3 +45,5 @@ class Config:
     pre_roll_ms: int = 300
     min_speech_ms: int = 250
     max_utterance_ms: int = 30000
+    llm_extra_body: dict[str, object] | None = None
+    speak_first_clause: bool = False

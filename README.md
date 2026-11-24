@@ -17,8 +17,9 @@ A small library for embedding an interruptible voice agent in a Python process:
 - **LLM:** any OpenAI-compatible API; `Config(llm_base_url=..., llm_model=...)`
   points at OpenAI, Ollama, llama.cpp, vLLM, or your own gateway
 
-It is not a platform, a model zoo, or a cloud speech wrapper. There is no
-dashboard, auth service, database, or provider registry.
+It is not a platform, a model zoo, or a cloud speech wrapper. The local web
+interface includes a small SQLite-backed conversation history; there is no
+hosted dashboard, auth service, or provider registry.
 
 ## Architecture
 
@@ -91,6 +92,54 @@ On Linux you may need PortAudio: `sudo apt install libportaudio2`.
 `--prompt`, `--input-device`, and `--output-device` are available. Audio is
 resampled between the device rate and 16 kHz internally. **Use headphones** —
 there is no echo cancellation, and speaker output will feed back into the VAD.
+
+## Mac 语音对话：DeepSeek、阿里云与 GPT-SoVITS
+
+这个入口使用 Mac 的麦克风和扬声器。Silero VAD 在本机检测说话，阿里云
+`paraformer-realtime-v2` 在说话期间通过 WebSocket 接收音频。停顿后，识别结果交给
+DeepSeek V4.1 Flash（`deepseek-flash`，关闭思考模式）。生成的回复按句送到
+AiServer 的 GPT-SoVITS v4 接口，默认用千夏（`chinatsu`）。建议戴耳机，避免喇叭声音触发麦克风。
+
+在项目目录安装并启动：
+
+```bash
+uv venv --python 3.12
+uv pip install -e '.[aliyun]'
+.venv/bin/python run_voice_chat.py -v
+```
+
+启动终端需有 `DEEPSEEK_API_KEY` 和 `ALIYUN_API_KEY`。也可以填在项目目录的 `.env`
+中，格式见 `.env.example`。阿里云密钥需有北京地域的 Paraformer 访问权限。
+启动前在 AiServer 确认 GPT-SoVITS v4 已运行，Mac 转发地址为 `http://127.0.0.1:19889/`。
+首次启动加载 Silero VAD，macOS 提示时需要允许终端使用麦克风。
+
+可以用 `--voice` 换音色，用 `--tts-language en` 练习纯英文对话，或用 `--prompt`
+指定对话主题。合成语言默认为中文混读模式（`zh`）。按 `Ctrl+C` 结束对话。
+回复首段在自然的短分句处开始合成，后续按整句合成。GPT-SoVITS 默认使用 8 步，
+命令行和网页服务均可用 `--tts-steps 4` 改为 4 步。
+
+### 本地网页
+
+```bash
+uv pip install -e '.[aliyun,web]'
+.venv/bin/python -m openvoicechat.migrate
+.venv/bin/python run_voice_web.py
+```
+
+打开 `http://127.0.0.1:18768`，选好麦克风和声音输出后点击「开始对话」。网页使用
+同一组环境变量，默认跟随 Mac 系统音频设置。接入耳机或麦克风后可以点「刷新设备」。
+停止对话后即可切换设备。页面会显示实时转写、千夏的文字回复，以及 ASR 判停至最终转写、
+LLM 首 token 和首段、TTS 首段的耗时。点击「停止对话」或关闭页面会释放麦克风。
+
+网页默认开启「扬声器模式」。千夏开始播放后暂停识别，等整轮音频播完并留出短暂的回声
+消退时间后恢复。看到「可以说话」再开口。戴耳机时可以在开始对话前关闭该模式，以便
+在回复播放期间插话。
+
+网页会在本机保存历史对话。点左侧记录可以查看完整内容，再点击「继续对话」即可沿用
+这段记录继续交流；「新建」会开始一段独立对话。数据库默认位于项目的
+`data/conversations.sqlite3`，并由 Git 忽略，不会随项目上传。
+角色示例在 `characters/example.json`；个人角色文件 `characters/mio.json` 会保留在本机，
+不会上传到 public 仓库。
 
 ## Models and hardware
 

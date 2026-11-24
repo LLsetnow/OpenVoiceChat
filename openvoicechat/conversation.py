@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import re
 import time
 from collections import deque
 
@@ -14,6 +15,11 @@ from .config import Config
 from .vad import VAD
 
 log = logging.getLogger(__name__)
+SENTENCE_END_CJK = re.compile(r"[。！？]+[”’」』）】]*")
+CLAUSE_END = re.compile(r"[，；：]|[,;:](?=\s)")
+EARLIER_SENTENCE_END = re.compile(r"[。！？.!?\n]")
+HAN_CHARACTER = re.compile(r"[\u3400-\u9fff]")
+LATIN_WORD = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*")
 
 
 class Conversation:
@@ -24,17 +30,23 @@ class Conversation:
         speech,
         *,
         system_prompt: str = "",
+        history: list[dict[str, str]] | None = None,
         config: Config | None = None,
         client: AsyncOpenAI | None = None,
         on_turn=None,
+        on_event=None,
         vad=None,
         verbose: bool = False,
+        speaker_mode: bool = False,
     ):
         self.speech = speech
         self.config = config or Config()
         self.system_prompt = system_prompt
         self.on_turn = on_turn
+        self.on_event = on_event
         self.verbose = verbose
+        self.speaker_mode = speaker_mode
+        self.input_paused = False
         self._owns_client = client is None
         if client is None:
             if not self.config.llm_api_key:
@@ -49,17 +61,28 @@ class Conversation:
         self.vad = vad or VAD(self.config.vad_threshold, self.config.sample_rate)
 
         self.input: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
-        self.output: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+        self.output: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=100)
         self.agent_speaking = False
         self.messages = (
             [{"role": "system", "content": system_prompt}] if system_prompt else []
         )
+        self.messages.extend(
+            {"role": item["role"], "content": item["content"]}
+            for item in (history or [])
+            if item.get("role") in {"user", "assistant"}
+            and isinstance(item.get("content"), str)
+            and item["content"].strip()
+        )
+        self._trim_history()
         self._frame_ms = 1000 * self.config.frame_samples / self.config.sample_rate
         self._chunk_bytes = (
             int(self.config.sample_rate * self.config.output_chunk_ms / 1000) * 2
         )
         self._stop = asyncio.Event()
+        self._turn_idle_since: float | None = None
+        self._need_reset = False
         self._turn_task: asyncio.Task | None = None
+        self._asr_task: asyncio.Task[str] | None = None
 
     async def run(self) -> None:
         pre_roll: deque[bytes] = deque(
@@ -75,6 +98,9 @@ class Conversation:
         endpoint_ms = self.config.endpoint_silence_ms
         min_speech_ms = self.config.min_speech_ms
         max_utterance_ms = self.config.max_utterance_ms
+        transcribe_stream = getattr(self.speech, "transcribe_stream", None)
+        asr_frames: asyncio.Queue[bytes | None] | None = None
+        was_paused = False
 
         def reset() -> None:
             nonlocal in_speech, voiced_run, capped, speech_ms, silence_ms, utterance_frames
@@ -93,25 +119,33 @@ class Conversation:
                 frame = await self.input.get()
                 if frame is None or self._stop.is_set():
                     break
+                if self._need_reset:
+                    self._need_reset = False
+                    if asr_frames is not None:
+                        await self._close_asr()
+                        asr_frames = None
+                    reset()
                 if not frame:
                     continue
-
-                if (
-                    self._turn_task is not None
-                    and self._turn_task.done()
-                    and self.output.empty()
-                ):
+                if self._turn_task is not None and self._turn_task.done():
                     self._turn_task = None
-                    self.agent_speaking = False
+                    self._turn_idle_since = time.monotonic()
+                    if self.output.empty() and not self.input_paused:
+                        self.agent_speaking = False
+
+                if self.input_paused:
+                    if self._turn_idle_since and (time.monotonic() - self._turn_idle_since > 12.0):
+                        self._turn_idle_since = None
+                        self.resume_input()
+                    else:
+                        if not was_paused:
+                            reset()
+                        was_paused = True
+                        continue
+                was_paused = False
+                self._turn_idle_since = None
 
                 voiced = bool(self.vad(frame))
-
-                if (
-                    voiced
-                    and not in_speech
-                    and (self._turn_task is not None or self.agent_speaking)
-                ):
-                    await self._interrupt()
 
                 if not in_speech:
                     if voiced:
@@ -119,6 +153,11 @@ class Conversation:
                         onset.append(frame)
                         if voiced_run >= 2:
                             in_speech = True
+                            if self._turn_task is not None or self.agent_speaking:
+                                if self.speaker_mode:
+                                    reset()
+                                    continue
+                                await self._interrupt()
                             speech_ms = voiced_run * self._frame_ms
                             pre_roll_ms = len(pre_roll) * self._frame_ms
                             utterance.extend(pre_roll)
@@ -126,6 +165,14 @@ class Conversation:
                             utterance_frames = len(pre_roll) + len(onset)
                             pre_roll.clear()
                             onset.clear()
+                            self._event("speech_start")
+                            if transcribe_stream is not None:
+                                asr_frames = asyncio.Queue()
+                                for audio in utterance:
+                                    asr_frames.put_nowait(audio)
+                                self._asr_task = asyncio.create_task(
+                                    transcribe_stream(_read_frames(asr_frames))
+                                )
                             self._log(
                                 f"speech start | pre-roll={pre_roll_ms:.0f}ms"
                             )
@@ -137,6 +184,8 @@ class Conversation:
                     continue
 
                 utterance.append(frame)
+                if asr_frames is not None and self._asr_task is not None and not self._asr_task.done():
+                    asr_frames.put_nowait(frame)
                 utterance_frames += 1
                 utterance_ms = utterance_frames * self._frame_ms
 
@@ -153,6 +202,9 @@ class Conversation:
                             utterance_ms = utterance_frames * self._frame_ms
                         if not capped:
                             capped = True
+                            if asr_frames is not None:
+                                await self._close_asr()
+                                asr_frames = None
                             self._log(
                                 f"utterance capped | keeping last {utterance_ms:.0f}ms"
                             )
@@ -168,11 +220,17 @@ class Conversation:
                     f"utterance={utterance_ms:.0f}ms speech={speech_ms:.0f}ms"
                 )
                 if speech_ms >= min_speech_ms and utterance:
+                    self._event("endpoint")
+                    if asr_frames is not None:
+                        asr_frames.put_nowait(None)
                     self._turn_task = asyncio.create_task(
-                        self._turn(b"".join(utterance))
+                        self._turn(b"".join(utterance), self._asr_task)
                     )
                 else:
+                    await self._close_asr()
                     self._log(f"drop short utterance | speech={speech_ms:.0f}ms")
+                    self._event("no_speech")
+                asr_frames = None
                 reset()
                 if pre_roll.maxlen:
                     pre_roll.append(frame)
@@ -180,10 +238,11 @@ class Conversation:
             self._stop.set()
             task, self._turn_task = self._turn_task, None
             if task is not None:
-                if not task.done():
+                if not task.done() and not task.cancelling():
                     task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+            await self._close_asr()
             self.agent_speaking = False
             _drain(self.output)
             if self._owns_client:
@@ -198,11 +257,29 @@ class Conversation:
         with contextlib.suppress(asyncio.QueueFull):
             self.input.put_nowait(None)
 
-    async def _turn(self, pcm: bytes) -> None:
+    def resume_input(self) -> None:
+        """Resume recognition after the local speaker has drained its last reply."""
+        self.agent_speaking = False
+        self.input_paused = False
+        _drain(self.input)
+        if not self._stop.is_set():
+            self._event("mic_paused", paused=False)
+
+    def notify_playback_ended(self) -> None:
+        """Called when browser finishes audio playback."""
+        self.agent_speaking = False
+        _drain(self.input)
+        self._need_reset = True
+        with contextlib.suppress(asyncio.QueueFull):
+            self.input.put_nowait(b"")
+        self.resume_input()
+
+    async def _turn(self, pcm: bytes, asr_task: asyncio.Task[str] | None = None) -> None:
         spoken: list[str] = []
         sentences: asyncio.Queue[str | None] = asyncio.Queue(maxsize=16)
         tts_task: asyncio.Task | None = None
         response = ""
+        stream = None
         completed = False
         started = time.monotonic()
         self._log(
@@ -210,24 +287,36 @@ class Conversation:
         )
         try:
             stt_started = time.monotonic()
-            text = (await self.speech.transcribe(pcm)).strip()
+            text = await asr_task if asr_task is not None else await self.speech.transcribe(pcm)
+            text = text.strip()
+            asr_ms = round(1000 * (time.monotonic() - stt_started))
             self._log(
-                f"STT ({1000 * (time.monotonic() - stt_started):.0f}ms): {text!r}"
+                f"STT ({asr_ms}ms): {text!r}"
             )
+            self._event("timing", stage="asr", milliseconds=asr_ms)
             if not text:
+                self.agent_speaking = False
+                self.input_paused = False
+                self._event("mic_paused", paused=False)
+                self._event("no_speech")
                 return
             self.messages.append({"role": "user", "content": text})
             self._emit("user", text)
 
-            tts_task = asyncio.create_task(self._speak(sentences, spoken))
             segmenter = pysbd.Segmenter(language="en", clean=False)
             buffer = ""
             llm_started = time.monotonic()
+            tts_task = asyncio.create_task(self._speak(sentences, spoken, llm_started))
             first_token = True
+            first_clause = self.config.speak_first_clause
+            request_options = (
+                {"extra_body": self.config.llm_extra_body} if self.config.llm_extra_body else {}
+            )
             stream = await self.client.chat.completions.create(
                 model=self.config.llm_model,
                 messages=self.messages,
                 stream=True,
+                **request_options,
             )
             async for chunk in stream:
                 for choice in getattr(chunk, "choices", None) or []:
@@ -236,11 +325,24 @@ class Conversation:
                         continue
                     if first_token:
                         first_token = False
-                        self._log(
-                            f"LLM first token ({1000 * (time.monotonic() - llm_started):.0f}ms)"
-                        )
+                        first_ms = round(1000 * (time.monotonic() - llm_started))
+                        self._log(f"LLM first token ({first_ms}ms)")
+                        self._event("timing", stage="llm_first", milliseconds=first_ms)
                     response += token
+                    self._event("assistant_partial", text=response)
                     buffer += token
+                    if first_clause and (part := _take_first_clause(buffer)) is not None:
+                        text, buffer = part
+                        await self._feed(sentences, text, tts_task)
+                        first_clause = False
+                    sentence_start = 0
+                    for boundary in SENTENCE_END_CJK.finditer(buffer):
+                        sentence = buffer[sentence_start : boundary.end()].strip()
+                        if sentence:
+                            await self._feed(sentences, sentence, tts_task)
+                            first_clause = False
+                        sentence_start = boundary.end()
+                    buffer = buffer[sentence_start:]
                     if any(mark in buffer for mark in ".!?\n"):
                         parts = segmenter.segment(buffer)
                         if len(parts) > 1:
@@ -248,6 +350,7 @@ class Conversation:
                                 sentence = sentence.strip()
                                 if sentence:
                                     await self._feed(sentences, sentence, tts_task)
+                                    first_clause = False
                             buffer = parts[-1]
 
             if buffer.strip():
@@ -255,16 +358,26 @@ class Conversation:
             await self._feed(sentences, None, tts_task)
             await tts_task
 
+            if not spoken:
+                self.agent_speaking = False
+                self.input_paused = False
+                self._event("mic_paused", paused=False)
             if response.strip():
                 self.messages.append({"role": "assistant", "content": response})
                 self._emit("assistant", response)
                 completed = True
+            else:
+                self._event("empty_reply")
         except asyncio.CancelledError:
             self._log(f"turn cancelled | spoken_sentences={len(spoken)}")
             partial = " ".join(spoken).strip()
             if partial and not completed:
                 self.messages.append({"role": "assistant", "content": partial})
                 self._emit("assistant", partial)
+            self.agent_speaking = False
+            self.input_paused = False
+            self._event("mic_paused", paused=False)
+            self._event("interrupted")
             raise
         except Exception as exc:
             self._log(f"turn error: {exc!r}")
@@ -273,6 +386,9 @@ class Conversation:
             if partial and not completed:
                 self.messages.append({"role": "assistant", "content": partial})
                 self._emit("assistant", partial)
+            self.agent_speaking = False
+            self.input_paused = False
+            self._event("mic_paused", paused=False)
             self._emit("error", str(exc))
         finally:
             self._log(f"turn finished ({1000 * (time.monotonic() - started):.0f}ms)")
@@ -282,20 +398,39 @@ class Conversation:
                     tts_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await tts_task
+            if asr_task is not None and self._asr_task is asr_task:
+                await self._close_asr()
+            close_stream = getattr(stream, "close", None)
+            if close_stream is not None:
+                with contextlib.suppress(Exception):
+                    await close_stream()
+            if not self._stop.is_set():
+                # Ordered after all PCM in this reply, including pauses between sentences.
+                await self.output.put(None)
 
-    async def _speak(self, sentences: asyncio.Queue, spoken: list[str]) -> None:
+    async def _speak(self, sentences: asyncio.Queue, spoken: list[str], llm_started: float) -> None:
+        first_segment = True
         while True:
             sentence = await sentences.get()
             if sentence is None:
                 return
             tts_started = time.monotonic()
+            if first_segment:
+                self._event("timing", stage="llm", milliseconds=round(1000 * (tts_started - llm_started)))
+                self._event("tts_start")
             audio = await self.speech.synthesize(sentence)
+            tts_ms = round(1000 * (time.monotonic() - tts_started))
+            if first_segment:
+                self._event("timing", stage="tts", milliseconds=tts_ms)
+                first_segment = False
             self._log(
-                f"TTS ({1000 * (time.monotonic() - tts_started):.0f}ms, "
-                f"{len(audio)} bytes): {sentence!r}"
+                f"TTS ({tts_ms}ms, {len(audio)} bytes): {sentence!r}"
             )
             if not audio:
                 continue
+            if self.speaker_mode and not self.input_paused:
+                self.input_paused = True
+                self._event("mic_paused", paused=True)
             spoken.append(sentence)
             self.agent_speaking = True
             for start in range(0, len(audio), self._chunk_bytes):
@@ -327,7 +462,19 @@ class Conversation:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        await self._close_asr()
         _drain(self.output)
+        self.input_paused = False
+        self._event("mic_paused", paused=False)
+        self._event("interrupted")
+
+    async def _close_asr(self) -> None:
+        task, self._asr_task = self._asr_task, None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     def _log(self, message: str) -> None:
         if self.verbose:
@@ -341,10 +488,30 @@ class Conversation:
         except Exception:
             log.exception("on_turn callback failed")
 
+    def _event(self, kind: str, **data) -> None:
+        if self.on_event is not None:
+            try:
+                self.on_event(kind, **data)
+            except Exception:
+                log.exception("on_event callback failed")
+
     def _trim_history(self) -> None:
         offset = 1 if self.system_prompt else 0
         if len(self.messages) > offset + 20:
             self.messages = self.messages[:offset] + self.messages[-20:]
+
+
+def _take_first_clause(buffer: str) -> tuple[str, str] | None:
+    """Cut only at a usable clause boundary, before any complete sentence."""
+    end = EARLIER_SENTENCE_END.search(buffer)
+    limit = end.start() if end else len(buffer)
+    for boundary in CLAUSE_END.finditer(buffer):
+        if boundary.end() > limit:
+            break
+        prefix = buffer[:boundary.end()].strip()
+        if len(HAN_CHARACTER.findall(prefix)) >= 7 or len(LATIN_WORD.findall(prefix)) >= 3:
+            return prefix, buffer[boundary.end():]
+    return None
 
 
 def _drain(queue: asyncio.Queue) -> None:
@@ -353,3 +520,8 @@ def _drain(queue: asyncio.Queue) -> None:
             queue.get_nowait()
         except asyncio.QueueEmpty:
             return
+
+
+async def _read_frames(queue: asyncio.Queue[bytes | None]):
+    while (frame := await queue.get()) is not None:
+        yield frame
