@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import re
 import uuid
 import wave
@@ -16,10 +17,11 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
 
 from .audio import SPEECH_RATE
+from .config import DEFAULT_SOVITS_URL
 
 ASR_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 ASR_MODEL = "qwen-audio-3.1-asr-flash-streaming"
-TTS_URL = "http://127.0.0.1:19889/"
+TTS_URL = (os.getenv("SOVITS_URL") or DEFAULT_SOVITS_URL).rstrip("/") + "/"
 TTS_VOICE = "chinatsu"
 TTS_SAMPLE_STEPS = 8
 COSYVOICE_URL = "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer"
@@ -32,6 +34,7 @@ class AliyunSpeechPipeline:
         on_partial: Callable[[str], None] | None = None,
         sample_steps: int = TTS_SAMPLE_STEPS,
         tts_engine: str = "gpt_sovits",
+        sovits_url: str | None = None,
     ):
         self._api_key = api_key
         self.voice = voice
@@ -39,12 +42,7 @@ class AliyunSpeechPipeline:
         self.on_partial = on_partial
         self.sample_steps = sample_steps
         self.tts_engine = tts_engine
-        self._tts = httpx.AsyncClient(timeout=45, trust_env=False)
-        self._api_key = api_key
-        self.voice = voice
-        self.language = language
-        self.on_partial = on_partial
-        self.sample_steps = sample_steps
+        self.sovits_url = (sovits_url or os.getenv("SOVITS_URL") or DEFAULT_SOVITS_URL).rstrip("/")
         self._tts = httpx.AsyncClient(timeout=45, trust_env=False)
 
     async def transcribe(self, pcm: bytes) -> str:
@@ -144,7 +142,8 @@ class AliyunSpeechPipeline:
         return await self._synthesize_sovits(clean_text)
 
     async def _synthesize_sovits(self, text: str) -> bytes:
-        response = await self._tts.post(TTS_URL, json={
+        sovits_endpoint = f"{self.sovits_url}/"
+        response = await self._tts.post(sovits_endpoint, json={
             "text": text,
             "voice": self.voice,
             "text_language": self.language,
