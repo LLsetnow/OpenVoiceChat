@@ -474,6 +474,13 @@ async def session(websocket: WebSocket):
                             speaker_mode=not barge_in,
                         )
                         output_task = asyncio.create_task(forward_audio_output(conversation))
+                        while (
+                            len(input_buffer) >= SPEECH_FRAME_BYTES
+                            and not conversation._stop.is_set()
+                        ):
+                            frame = bytes(input_buffer[:SPEECH_FRAME_BYTES])
+                            del input_buffer[:SPEECH_FRAME_BYTES]
+                            await conversation.input.put(frame)
                         publish("state", state="running")
                         if initial_text:
                             await conversation.send_text(initial_text)
@@ -531,6 +538,11 @@ async def session(websocket: WebSocket):
                         frame = bytes(input_buffer[:SPEECH_FRAME_BYTES])
                         del input_buffer[:SPEECH_FRAME_BYTES]
                         await conversation.input.put(frame)
+                elif voice_task is not None and not voice_task.done():
+                    input_buffer.extend(raw)
+                    max_startup_buffer = SPEECH_FRAME_BYTES * 50
+                    if len(input_buffer) > max_startup_buffer:
+                        del input_buffer[:-max_startup_buffer]
             elif message.get("text"):
                 try:
                     command = json.loads(message["text"])
