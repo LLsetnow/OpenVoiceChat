@@ -18,8 +18,10 @@ A small library for embedding an interruptible voice agent in a Python process:
   points at OpenAI, Ollama, llama.cpp, vLLM, or your own gateway
 
 It is not a platform, a model zoo, or a cloud speech wrapper. The local web
-interface includes a small SQLite-backed conversation history; there is no
-hosted dashboard, auth service, or provider registry.
+interface includes SQLite-backed conversation history with resume support,
+and a fully internationalized UI (English / Chinese) with automatic locale
+detection and instant switching. There is no hosted dashboard, auth service,
+or provider registry.
 
 ## Architecture
 
@@ -135,9 +137,23 @@ LLM 首 token 和首段、TTS 首段的耗时。点击「停止对话」或关�
 消退时间后恢复。看到「可以说话」再开口。戴耳机时可以在开始对话前关闭该模式，以便
 在回复播放期间插话。
 
-网页会在本机保存历史对话。点左侧记录可以查看完整内容，再点击「继续对话」即可沿用
-这段记录继续交流；「新建」会开始一段独立对话。数据库默认位于项目的
-`data/conversations.sqlite3`，并由 Git 忽略，不会随项目上传。
+#### 历史对话记录与继续交流
+
+网页支持在本地完整保存与恢复会话：
+
+- **数据存储与迁移**：对话记录持久化保存在本地 SQLite 数据库（默认路径为 `data/conversations.sqlite3`），已加入 `.gitignore`，仅存储在本机，不会随 Git 提交或上传至公开仓库。首次使用或更新代码后，请执行 `.venv/bin/python -m openvoicechat.migrate` 进行表结构初始化或迁移；若历史列表显示“无法加载历史记录 / Conversation history is unavailable”，说明数据库未迁移或服务未就绪，运行迁移命令后刷新页面即可恢复。
+- **查看历史**：左侧面板按更新时间倒序列出历史会话卡片。点击任意卡片，右侧即可展开该会话全部的历史交互气泡与时间线。
+- **继续交流**：选中历史会话后，点击操作栏的「继续对话」（英文模式为「Resume conversation」），系统会自动将过往对话记录载入当前会话上下文，大模型将基于上文记忆无缝继续交流。
+- **新建对话**：点击「新建」（英文模式为「New」）即可清空当前会话上下文，开始一段全新的独立对话。
+
+#### 全界面中英文国际化
+
+网页提供完整的中英文双语支持：
+
+- **自动适配**：首次打开页面时，前端会自动识别浏览器与系统语言（`navigator.language`）。中文环境默认显示简体中文（`zh-CN`），其他环境默认显示英文（`en`）。亦可在 URL 后面附加 `?lang=zh-CN` 或 `?lang=en` 强制指定显示语言。
+- **顶部一键切换**：页面顶部导航栏右侧（状态指示灯旁）提供了语言切换按钮（`文/A English` / `文/A 中文`）。点击即可无刷新秒级切换全站文案，包括页面标题、控制按钮、音色与角色描述、音频设备状态、实时延迟指标、角色称呼（你 ↔ You，千夏 ↔ Chinatsu）以及交互提示语。
+- **偏好持久化**：用户手动切换的语言设置会自动保存在浏览器的 `localStorage` 中，后续访问页面将优先保留用户的手动设置。
+
 角色示例在 `characters/example.json`；个人角色文件 `characters/mio.json` 会保留在本机，
 不会上传到 public 仓库。
 
