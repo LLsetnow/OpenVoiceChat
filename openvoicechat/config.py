@@ -21,18 +21,16 @@ DEFAULT_LLM_MODEL = "gpt-6-luna"
 class Config:
     # Secrets: environment only.
     llm_api_key: str = field(
-        default_factory=lambda: (
-            os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY", "")
-        )
+        default_factory=lambda: os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY", "")
     )
-    agent_api_token: str = field(
-        default_factory=lambda: os.getenv("AGENT_API_TOKEN", "")
-    )
+    agent_api_token: str = field(default_factory=lambda: os.getenv("AGENT_API_TOKEN", ""))
 
     # LLM endpoint.
     llm_base_url: str = DEFAULT_LLM_BASE_URL
     llm_model: str = DEFAULT_LLM_MODEL
     llm_timeout_s: float = 15.0
+    context_token_budget: int = 2048
+    summary_token_budget: int = 512
 
     # Runtime and turn taking.
     max_sessions: int = 5

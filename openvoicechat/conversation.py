@@ -20,6 +20,66 @@ CLAUSE_END = re.compile(r"[，；：]|[,;:](?=\s)")
 EARLIER_SENTENCE_END = re.compile(r"[。！？.!?\n]")
 HAN_CHARACTER = re.compile(r"[\u3400-\u9fff]")
 LATIN_WORD = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*")
+CJK_CHAR = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def estimate_tokens(text: str) -> int:
+    """Fast heuristic token estimator for multilingual Chinese and English text."""
+    if not text:
+        return 0
+    if not isinstance(text, str):
+        text = str(text)
+    cjk_count = len(CJK_CHAR.findall(text))
+    non_cjk = CJK_CHAR.sub(" ", text)
+    words = len(non_cjk.split())
+    return int(cjk_count * 1.3) + int(words * 1.2) + 4
+
+
+def estimate_messages_tokens(messages: list[dict]) -> int:
+    """Calculate total estimated tokens for a list of message dictionaries."""
+    return sum(estimate_tokens(m.get("content", "")) + 4 for m in messages)
+
+
+def _summarize_turns(
+    overflow_turns: list[dict], existing_summary: str = "", max_tokens: int = 512
+) -> str:
+    """Extract key facts from older turns and merge with existing summary."""
+    points: list[str] = []
+    if existing_summary and existing_summary.strip():
+        for line in existing_summary.strip().splitlines():
+            cleaned = line.strip().lstrip("•-* \t")
+            if cleaned and not cleaned.startswith("【"):
+                points.append(cleaned)
+
+    for turn in overflow_turns:
+        role = turn.get("role")
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) > 100:
+            first_clause = content.split("。")[0].split(".")[0].strip()
+            snippet = first_clause if len(first_clause) >= 10 else content[:100] + "…"
+        else:
+            snippet = content
+        prefix = "用户提到" if role == "user" else "助手说明"
+        fact = f"{prefix}：{snippet}"
+        if fact not in points:
+            points.append(fact)
+
+    formatted_lines = [f"- {p}" for p in points]
+    summary_text = "\n".join(formatted_lines)
+    while formatted_lines and estimate_tokens(summary_text) > max_tokens:
+        formatted_lines.pop(0)
+        summary_text = "\n".join(formatted_lines)
+    return summary_text
+
+
+def _compress_summary(summary: str, max_tokens: int = 512) -> str:
+    """Compress summary text to stay within max_tokens."""
+    lines = [line for line in summary.strip().splitlines() if line.strip()]
+    while lines and estimate_tokens("\n".join(lines)) > max_tokens:
+        lines.pop(0)
+    return "\n".join(lines)
 
 
 class Conversation:
@@ -31,9 +91,11 @@ class Conversation:
         *,
         system_prompt: str = "",
         history: list[dict[str, str]] | None = None,
+        summary: str | None = None,
         config: Config | None = None,
         client: AsyncOpenAI | None = None,
         on_turn=None,
+        on_summary=None,
         on_event=None,
         vad=None,
         verbose: bool = False,
@@ -42,7 +104,9 @@ class Conversation:
         self.speech = speech
         self.config = config or Config()
         self.system_prompt = system_prompt
+        self.summary = summary or ""
         self.on_turn = on_turn
+        self.on_summary = on_summary
         self.on_event = on_event
         self.verbose = verbose
         self.speaker_mode = speaker_mode
@@ -63,9 +127,7 @@ class Conversation:
         self.input: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
         self.output: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=100)
         self.agent_speaking = False
-        self.messages = (
-            [{"role": "system", "content": system_prompt}] if system_prompt else []
-        )
+        self.messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
         self.messages.extend(
             {"role": item["role"], "content": item["content"]}
             for item in (history or [])
@@ -75,9 +137,7 @@ class Conversation:
         )
         self._trim_history()
         self._frame_ms = 1000 * self.config.frame_samples / self.config.sample_rate
-        self._chunk_bytes = (
-            int(self.config.sample_rate * self.config.output_chunk_ms / 1000) * 2
-        )
+        self._chunk_bytes = int(self.config.sample_rate * self.config.output_chunk_ms / 1000) * 2
         self._stop = asyncio.Event()
         self._turn_idle_since: float | None = None
         self._need_reset = False
@@ -85,9 +145,7 @@ class Conversation:
         self._asr_task: asyncio.Task[str] | None = None
 
     async def run(self) -> None:
-        pre_roll: deque[bytes] = deque(
-            maxlen=math.ceil(self.config.pre_roll_ms / self._frame_ms)
-        )
+        pre_roll: deque[bytes] = deque(maxlen=math.ceil(self.config.pre_roll_ms / self._frame_ms))
         onset: list[bytes] = []
         utterance: deque[bytes] = deque()
         utterance_frames = 0
@@ -173,9 +231,7 @@ class Conversation:
                                 self._asr_task = asyncio.create_task(
                                     transcribe_stream(_read_frames(asr_frames))
                                 )
-                            self._log(
-                                f"speech start | pre-roll={pre_roll_ms:.0f}ms"
-                            )
+                            self._log(f"speech start | pre-roll={pre_roll_ms:.0f}ms")
                     else:
                         voiced_run = 0
                         onset.clear()
@@ -184,7 +240,11 @@ class Conversation:
                     continue
 
                 utterance.append(frame)
-                if asr_frames is not None and self._asr_task is not None and not self._asr_task.done():
+                if (
+                    asr_frames is not None
+                    and self._asr_task is not None
+                    and not self._asr_task.done()
+                ):
                     asr_frames.put_nowait(frame)
                 utterance_frames += 1
                 utterance_ms = utterance_frames * self._frame_ms
@@ -205,9 +265,7 @@ class Conversation:
                             if asr_frames is not None:
                                 await self._close_asr()
                                 asr_frames = None
-                            self._log(
-                                f"utterance capped | keeping last {utterance_ms:.0f}ms"
-                            )
+                            self._log(f"utterance capped | keeping last {utterance_ms:.0f}ms")
                     continue
 
                 silence_ms += self._frame_ms
@@ -368,18 +426,14 @@ class Conversation:
         if text is not None:
             self._log(f"turn start | text={text!r}")
         else:
-            self._log(
-                f"turn start | pcm={len(pcm) / 2 / self.config.sample_rate * 1000:.0f}ms"
-            )
+            self._log(f"turn start | pcm={len(pcm) / 2 / self.config.sample_rate * 1000:.0f}ms")
         try:
             if text is None:
                 stt_started = time.monotonic()
                 text = await asr_task if asr_task is not None else await self.speech.transcribe(pcm)
                 text = text.strip()
                 asr_ms = round(1000 * (time.monotonic() - stt_started))
-                self._log(
-                    f"STT ({asr_ms}ms): {text!r}"
-                )
+                self._log(f"STT ({asr_ms}ms): {text!r}")
                 self._event("timing", stage="asr", milliseconds=asr_ms)
             else:
                 text = text.strip()
@@ -391,6 +445,7 @@ class Conversation:
                 self._event("no_speech")
                 return
             self.messages.append({"role": "user", "content": text})
+            self._trim_history()
             self._emit("user", text)
 
             segmenter = pysbd.Segmenter(language="en", clean=False)
@@ -521,16 +576,16 @@ class Conversation:
             tts_started = time.monotonic()
             if first_segment:
                 if llm_started > 0:
-                    self._event("timing", stage="llm", milliseconds=round(1000 * (tts_started - llm_started)))
+                    self._event(
+                        "timing", stage="llm", milliseconds=round(1000 * (tts_started - llm_started))
+                    )
                 self._event("tts_start")
             audio = await self.speech.synthesize(sentence)
             tts_ms = round(1000 * (time.monotonic() - tts_started))
             if first_segment:
                 self._event("timing", stage="tts", milliseconds=tts_ms)
                 first_segment = False
-            self._log(
-                f"TTS ({tts_ms}ms, {len(audio)} bytes): {sentence!r}"
-            )
+            self._log(f"TTS ({tts_ms}ms, {len(audio)} bytes): {sentence!r}")
             if not audio:
                 continue
             if self.speaker_mode and not self.input_paused:
@@ -560,9 +615,7 @@ class Conversation:
         return False
 
     async def _interrupt(self) -> None:
-        self._log(
-            f"barge-in | cancelling turn, output_chunks={self.output.qsize()}"
-        )
+        self._log(f"barge-in | cancelling turn, output_chunks={self.output.qsize()}")
         task, self._turn_task = self._turn_task, None
         self.agent_speaking = False
         if task is not None and not task.done():
@@ -603,9 +656,81 @@ class Conversation:
                 log.exception("on_event callback failed")
 
     def _trim_history(self) -> None:
-        offset = 1 if self.system_prompt else 0
-        if len(self.messages) > offset + 20:
-            self.messages = self.messages[:offset] + self.messages[-20:]
+        turns = [
+            m
+            for m in self.messages
+            if m.get("role") in {"user", "assistant"}
+            and isinstance(m.get("content"), str)
+            and m["content"].strip()
+        ]
+        budget = getattr(self.config, "context_token_budget", 2048)
+        summary_budget = getattr(self.config, "summary_token_budget", 512)
+        sys_tokens = estimate_tokens(self.system_prompt) if self.system_prompt else 0
+        summary_tokens = (estimate_tokens(self.summary) + 15) if self.summary else 0
+
+        avail = budget - sys_tokens - summary_tokens
+        if avail < 100 and self.summary:
+            self.summary = _compress_summary(self.summary, max_tokens=summary_budget)
+            summary_tokens = (estimate_tokens(self.summary) + 15) if self.summary else 0
+            avail = budget - sys_tokens - summary_tokens
+
+        avail = max(40, avail)
+
+        kept_turns: list[dict] = []
+        turn_cost = 0
+        for t in reversed(turns):
+            cost = estimate_tokens(t["content"]) + 4
+            if not kept_turns or (turn_cost + cost <= avail):
+                kept_turns.insert(0, t)
+                turn_cost += cost
+            else:
+                break
+
+        overflow_turns = turns[: len(turns) - len(kept_turns)]
+        if overflow_turns:
+            updated_summary = _summarize_turns(
+                overflow_turns, self.summary, max_tokens=summary_budget
+            )
+            if updated_summary != self.summary:
+                self.summary = updated_summary
+                if self.on_summary is not None:
+                    try:
+                        self.on_summary(self.summary)
+                    except Exception:
+                        log.exception("on_summary callback failed")
+
+        def build_messages(k_turns: list[dict], sum_text: str) -> list[dict]:
+            res = []
+            if self.system_prompt:
+                res.append({"role": "system", "content": self.system_prompt})
+            if sum_text:
+                res.append(
+                    {
+                        "role": "system",
+                        "content": f"【前情提要 / 早期对话关键事实】\n{sum_text}",
+                    }
+                )
+            res.extend(k_turns)
+            return res
+
+        rebuilt = build_messages(kept_turns, self.summary)
+
+        # Strictly enforce context_token_budget
+        while len(kept_turns) > 1 and estimate_messages_tokens(rebuilt) > budget:
+            popped = kept_turns.pop(0)
+            overflow_turns.append(popped)
+            rebuilt = build_messages(kept_turns, self.summary)
+
+        # If still over budget, compress summary lines
+        while estimate_messages_tokens(rebuilt) > budget and self.summary:
+            shrunk = _compress_summary(self.summary, max_tokens=max(20, summary_budget - 30))
+            if shrunk == self.summary:
+                break
+            self.summary = shrunk
+            summary_budget = max(20, summary_budget - 30)
+            rebuilt = build_messages(kept_turns, self.summary)
+
+        self.messages = rebuilt
 
 
 def _take_first_clause(buffer: str) -> tuple[str, str] | None:
@@ -615,9 +740,9 @@ def _take_first_clause(buffer: str) -> tuple[str, str] | None:
     for boundary in CLAUSE_END.finditer(buffer):
         if boundary.end() > limit:
             break
-        prefix = buffer[:boundary.end()].strip()
+        prefix = buffer[: boundary.end()].strip()
         if len(HAN_CHARACTER.findall(prefix)) >= 7 or len(LATIN_WORD.findall(prefix)) >= 3:
-            return prefix, buffer[boundary.end():]
+            return prefix, buffer[boundary.end() :]
     return None
 
 

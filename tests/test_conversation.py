@@ -212,6 +212,92 @@ async def test_send_text_produces_audio_and_turn():
     await stop(conv, run_task)
 
 
+async def test_context_budget_and_summarization_with_long_history():
+    events = []
+    captured_summaries = []
+
+    # Create 30 turns of history
+    history = []
+    for i in range(15):
+        history.append(
+            {
+                "role": "user",
+                "content": f"第{i + 1}次提问：关于用户喜欢千夏以及去杭州的关键信息{i + 1}",
+            }
+        )
+        history.append(
+            {"role": "assistant", "content": f"第{i + 1}次回合回复：收到了你的第{i + 1}次提问"}
+        )
+
+    config = Config(
+        context_token_budget=200,
+        summary_token_budget=100,
+        endpoint_silence_ms=64,
+        min_speech_ms=32,
+        pre_roll_ms=0,
+    )
+    conv = Conversation(
+        FakeSpeech(),
+        system_prompt="你是一个贴心的助理。",
+        history=history,
+        config=config,
+        client=FakeClient(),
+        on_turn=lambda role, text: events.append((role, text)),
+        on_summary=lambda text: captured_summaries.append(text),
+        vad=FakeVAD(),
+    )
+
+    # Check that summary was generated and captured
+    assert len(captured_summaries) > 0
+    latest_summary = captured_summaries[-1]
+    assert "用户提到" in latest_summary
+    assert "关键信息" in latest_summary
+
+    # Total tokens in messages must be <= context_token_budget
+    from openvoicechat.conversation import estimate_messages_tokens
+
+    total_tokens = estimate_messages_tokens(conv.messages)
+    assert total_tokens <= config.context_token_budget
+
+    # First message is system prompt
+    assert conv.messages[0] == {"role": "system", "content": "你是一个贴心的助理。"}
+    # Second message is summary of key facts
+    assert conv.messages[1]["role"] == "system"
+    assert "前情提要" in conv.messages[1]["content"]
+    assert "关键信息" in conv.messages[1]["content"]
+
+    # Recent turns are preserved at the end
+    assert conv.messages[-1]["role"] == "assistant"
+    assert conv.messages[-1]["content"] == "第15次回合回复：收到了你的第15次提问"
+
+
+async def test_resume_conversation_with_existing_summary():
+    events = []
+    history = [
+        {"role": "user", "content": "现在几点了？"},
+        {"role": "assistant", "content": "现在是中午十二点。"},
+    ]
+    existing_summary = "- 用户提到：喜欢千夏并计划前往杭州\n- 助手确认：已记录行程"
+
+    config = Config(context_token_budget=500)
+    conv = Conversation(
+        FakeSpeech(),
+        system_prompt="你是一个贴心的助理。",
+        history=history,
+        summary=existing_summary,
+        config=config,
+        client=FakeClient(),
+        on_turn=lambda role, text: events.append((role, text)),
+        vad=FakeVAD(),
+    )
+
+    assert conv.messages[0] == {"role": "system", "content": "你是一个贴心的助理。"}
+    assert conv.messages[1]["role"] == "system"
+    assert "喜欢千夏并计划前往杭州" in conv.messages[1]["content"]
+    assert conv.messages[-2] == {"role": "user", "content": "现在几点了？"}
+    assert conv.messages[-1] == {"role": "assistant", "content": "现在是中午十二点。"}
+
+
 async def test_tts_timeout_preserves_text_and_context_and_allows_next_turn():
     events = []
     recorded_events = []

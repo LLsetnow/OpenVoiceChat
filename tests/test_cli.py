@@ -1,5 +1,6 @@
 """Tests for the ovc command line."""
 
+import builtins
 import json
 import subprocess
 import sys
@@ -26,6 +27,22 @@ def test_doctor_json_schema(capsys):
     for check in payload["checks"]:
         assert set(check) == {"name", "status", "detail"}
         assert check["status"] in {"ok", "warn", "missing", "fail"}
+
+
+def test_doctor_keeps_reporting_when_audio_import_cannot_initialize(monkeypatch, capsys):
+    original_import = builtins.__import__
+
+    def import_with_unavailable_audio(name, *args, **kwargs):
+        if name == "sounddevice":
+            raise OSError("PortAudio could not initialize")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_unavailable_audio)
+    assert cli.main(["doctor", "--json"]) in (0, 2)
+    payload = json.loads(capsys.readouterr().out)
+    audio = next(check for check in payload["checks"] if check["name"] == "audio")
+    assert audio["status"] == "warn"
+    assert "PortAudio could not initialize" in audio["detail"]
 
 
 def test_package_import_stays_lazy():

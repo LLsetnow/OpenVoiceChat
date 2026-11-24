@@ -72,6 +72,8 @@ def _audio() -> Check:
         import sounddevice as sd
     except ImportError:
         return Check("audio", "missing", 'pip install "openvoicechat[local]"')
+    except Exception as exc:  # noqa: BLE001 - PortAudio can fail during import
+        return Check("audio", "warn", f"sounddevice could not initialize: {exc}")
     try:
         devices = sd.query_devices()
     except Exception as exc:  # noqa: BLE001 - PortAudio raises its own types

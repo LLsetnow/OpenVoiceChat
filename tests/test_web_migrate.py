@@ -38,7 +38,7 @@ def test_empty_data_dir_first_startup_auto_migrates(clean_db_env):
         assert status_resp.status_code == 200
         status_data = status_resp.json()
         assert status_data["status"] == "ready"
-        assert status_data["database"]["applied"] == [1]
+        assert status_data["database"]["applied"] == [1, 2]
         assert db_file.is_file()
 
         resp = client.get("/api/conversations")
