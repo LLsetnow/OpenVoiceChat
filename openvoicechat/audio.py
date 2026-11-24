@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -15,6 +16,42 @@ SPEECH_RATE = 16000
 FRAME_SAMPLES = 512
 FRAME_SECONDS = FRAME_SAMPLES / SPEECH_RATE
 SPEECH_FRAME_BYTES = FRAME_SAMPLES * 2
+SPEAKER_ECHO_TAIL_SECONDS = 0.25
+
+
+def audio_devices(*, refresh: bool = False) -> dict:
+    """List selectable devices and the current system defaults by direction."""
+    import sounddevice as sd
+
+    if refresh and sys.platform == "darwin":
+        # Core Audio's PortAudio device list is built at initialization.
+        # Callers refresh only when all streams are closed.
+        if sd._initialized:
+            sd._terminate()
+        sd._initialize()
+
+    devices = sd.query_devices()
+    host_apis = sd.query_hostapis()
+    defaults = dict(zip(("input", "output"), sd.default.device))
+    result = {}
+    for kind, default in defaults.items():
+        entries = []
+        names: Counter = Counter()
+        for device in devices:
+            if not device[f"max_{kind}_channels"]:
+                continue
+            name = device["name"]
+            host = host_apis[device["hostapi"]]["name"]
+            names[host, name] += 1
+            occurrence = names[host, name]
+            entries.append({
+                "id": f"{host}:{name}:{occurrence}",
+                "label": name if occurrence == 1 else f"{name} ({occurrence})",
+                "index": device["index"],
+            })
+        default_label = next((item["label"] for item in entries if item["index"] == default), None)
+        result[kind] = {"default": default_label, "devices": entries}
+    return result
 
 
 class Pcm16Resampler:
@@ -34,6 +71,11 @@ class Pcm16Resampler:
             return pcm
         data = np.frombuffer(pcm, dtype=np.int16)
         return self._stream.resample_chunk(data, last=False).tobytes()
+
+    def finish(self) -> bytes:
+        if self._identity:
+            return b""
+        return self._stream.resample_chunk(np.empty(0, dtype=np.int16), last=True).tobytes()
 
 
 def _default_rate(sounddevice, kind: str, device=None) -> int:
@@ -64,11 +106,19 @@ async def microphone(conversation: Conversation, stream, rate: int) -> None:
             await conversation.input.put(chunk)
 
 
-async def speaker(conversation: Conversation, stream, rate: int) -> None:
+async def speaker(conversation: Conversation, stream, rate: int, *, input_latency: float = 0) -> None:
     """Drain conversation.output and write it at the device rate."""
     resampler = Pcm16Resampler(SPEECH_RATE, rate)
     while True:
         pcm = await conversation.output.get()
+        if pcm is None:
+            if tail := resampler.finish():
+                await asyncio.to_thread(stream.write, tail)
+            resampler = Pcm16Resampler(SPEECH_RATE, rate)
+            # Blocking writes hand PCM to PortAudio, which still has buffered playback.
+            await asyncio.sleep(stream.latency + input_latency + SPEAKER_ECHO_TAIL_SECONDS)
+            conversation.resume_input()
+            continue
         data = resampler.process(pcm)
         if data:
             await asyncio.to_thread(stream.write, data)
@@ -79,8 +129,9 @@ async def run_local(
     *,
     input_device=None,
     output_device=None,
+    on_ready=None,
 ) -> None:
-    """Run one conversation against the default microphone and speaker."""
+    """Run one conversation against the chosen microphone and speaker."""
     try:
         import sounddevice as sd
     except ImportError as exc:
@@ -114,22 +165,23 @@ async def run_local(
                 microphone(conversation, input_stream, input_rate), name="microphone"
             ),
             asyncio.create_task(
-                speaker(conversation, output_stream, output_rate), name="speaker"
+                speaker(conversation, output_stream, output_rate, input_latency=input_stream.latency),
+                name="speaker",
             ),
         ]
         try:
+            if on_ready is not None:
+                on_ready()
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 if task.cancelled():
                     continue
                 if task.exception() is not None:
-                    print(
-                        f"{task.get_name()} failed: {task.exception()}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    raise RuntimeError(f"{task.get_name()} failed: {task.exception()}") from task.exception()
         finally:
             conversation.stop()
-            for task in tasks:
+            input_stream.abort()
+            output_stream.abort()
+            for task in tasks[1:]:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
