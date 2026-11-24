@@ -15,6 +15,7 @@ const ttsEngineSelect = element("tts-engine-select");
 const voiceSelect = element("voice-select");
 const historyList = element("history-list");
 const newConversationButton = element("new-conversation");
+const langToggle = element("lang-toggle");
 const avatars = () => document.querySelectorAll("[data-avatar]");
 function setAvatar(src) {
   if (src && typeof src === "string" && src.startsWith("/assets/")) {
@@ -31,6 +32,7 @@ let charactersData = [
   { id: "mio", name: "千夏", avatar: "assets/img/chinatsu.png", voice: "chinatsu", tts_engine: "gpt_sovits" }
 ];
 let conversationData = [];
+let currentConversationMessages = [];
 let selectedConversationId = null;
 let voicesData = {
   gpt_sovits: [
@@ -784,12 +786,13 @@ function showMessage(role, text, draft) {
 }
 
 function renderConversationMessages(history) {
+  currentConversationMessages = Array.isArray(history) ? [...history] : [];
   drafts.clear();
   messages.replaceChildren();
-  for (const item of history) {
+  for (const item of currentConversationMessages) {
     showMessage(item.role, item.content, false);
   }
-  element("empty").hidden = history.length > 0;
+  element("empty").hidden = currentConversationMessages.length > 0;
   scroller.scrollTop = scroller.scrollHeight;
   phase("");
 }
@@ -879,6 +882,7 @@ function onEvent(event) {
       break;
     case "message":
       showMessage(event.role, event.text, false);
+      currentConversationMessages.push({ role: event.role, content: event.text });
       refreshConversationList();
       if (event.role === "user") phase(t("phase_llm_generating", { name: names.assistant }), "llm");
       if (event.role === "assistant") phase("");
@@ -987,3 +991,35 @@ updateMicStatus();
 connect();
 
 requestDevices();
+
+if (langToggle) {
+  langToggle.addEventListener("click", () => {
+    const current = window.ovcI18n ? window.ovcI18n.locale : "zh-CN";
+    const next = current.startsWith("zh") ? "en" : "zh-CN";
+    if (window.ovcI18n && window.ovcI18n.setLocale) {
+      window.ovcI18n.setLocale(next);
+    }
+  });
+}
+
+window.addEventListener("ovc:locale-changed", () => {
+  const char = charactersData.find(item => item.id === (charSelect ? charSelect.value : ""));
+  names.assistant = getCharacterName(char);
+  if (charNameDisplay) charNameDisplay.textContent = names.assistant;
+  if (charSelect && charSelect.value) {
+    const prevVal = charSelect.value;
+    populateCharacters(charactersData);
+    charSelect.value = prevVal;
+  }
+  const prevVoice = voiceSelect ? voiceSelect.value : "";
+  updateVoiceOptions();
+  if (voiceSelect && prevVoice) {
+    voiceSelect.value = prevVoice;
+  }
+  updateControls();
+  updateMicStatus();
+  refreshConversationList();
+  if (currentConversationMessages.length > 0) {
+    renderConversationMessages(currentConversationMessages);
+  }
+});

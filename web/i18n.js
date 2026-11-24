@@ -42,6 +42,8 @@
       refresh_devices: "刷新设备",
       refresh_identifying: "正在识别…",
       identifying_devices: "正在识别设备",
+      lang_switch_label: "English",
+      lang_toggle_aria: "切换为英文",
 
       // 音频设备与模式
       audio_devices_label: "音频设备",
@@ -168,6 +170,8 @@
       refresh_devices: "Refresh Devices",
       refresh_identifying: "Detecting…",
       identifying_devices: "Detecting devices…",
+      lang_switch_label: "中文",
+      lang_toggle_aria: "Switch to Chinese",
 
       // Audio devices & modes
       audio_devices_label: "Audio Devices",
@@ -256,18 +260,25 @@
 
   const userLang = (navigator.language || navigator.userLanguage || "").toLowerCase();
   const urlLang = new URLSearchParams(window.location.search).get("lang");
+  let savedLang = null;
+  try {
+    savedLang = localStorage.getItem("openvoicechat.locale");
+  } catch {}
+
   let locale = "zh-CN";
   if (urlLang === "en" || urlLang === "zh-cn" || urlLang === "zh") {
     locale = urlLang.startsWith("zh") ? "zh-CN" : "en";
+  } else if (savedLang === "en" || savedLang === "zh-CN") {
+    locale = savedLang;
   } else {
     locale = userLang.startsWith("zh") ? "zh-CN" : "en";
   }
 
-  const dictionary = translations[locale];
   const translate = (key, params = {}) => {
-    let text = dictionary[key] || translations["zh-CN"][key] || key;
+    const dict = translations[locale] || translations["zh-CN"];
+    let text = dict[key] || translations["zh-CN"][key] || key;
     const mergedParams = {
-      name: dictionary["assistant_default_name"] || "千夏",
+      name: dict["assistant_default_name"] || "千夏",
       ...(params && typeof params === "object" ? params : {}),
     };
     for (const [k, v] of Object.entries(mergedParams)) {
@@ -294,11 +305,29 @@
     }
   }
 
+  function setLocale(nextLocale) {
+    if (nextLocale !== "en" && nextLocale !== "zh-CN") return;
+    locale = nextLocale;
+    try {
+      localStorage.setItem("openvoicechat.locale", locale);
+    } catch {}
+    applyTranslations();
+    window.dispatchEvent(new CustomEvent("ovc:locale-changed", { detail: { locale } }));
+  }
+
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => applyTranslations());
   } else {
     applyTranslations();
   }
 
-  window.ovcI18n = { locale, translate, t: translate, applyTranslations };
+  window.ovcI18n = {
+    get locale() {
+      return locale;
+    },
+    translate,
+    t: translate,
+    applyTranslations,
+    setLocale,
+  };
 })();
