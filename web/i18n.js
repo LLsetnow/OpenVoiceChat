@@ -82,6 +82,9 @@
       new_conversation: "新对话",
       db_migration_failed: "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
       db_migration_recovery: "请运行 python -m openvoicechat.migrate 恢复数据库。",
+      session_occupied: "语音会话正在其他标签页运行。",
+      takeover_session: "接管会话",
+      session_taken_over: "语音会话已被其他标签页接管。",
 
       // 对话面板
       dialogue_title: "对话记录",
@@ -225,6 +228,9 @@
       new_conversation: "New conversation",
       db_migration_failed: "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
       db_migration_recovery: "Please run python -m openvoicechat.migrate to restore the database.",
+      session_occupied: "Voice session is currently active in another tab.",
+      takeover_session: "Take Over",
+      session_taken_over: "Voice session has been taken over by another tab.",
 
       // Dialogue panel
       dialogue_title: "Conversation",

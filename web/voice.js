@@ -38,6 +38,9 @@ let charactersData = [
 let conversationData = [];
 let currentConversationMessages = [];
 let selectedConversationId = null;
+let currentTurnId = 0;
+let cancelledTurnIds = new Set();
+let isOccupied = false;
 let voicesData = {
   gpt_sovits: [
     { id: "chinatsu", name: "千夏" },
@@ -582,14 +585,22 @@ function checkTurnCompletion() {
     isPlayingAudio = false;
     hasPlayedAudioInTurn = false;
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ action: "playback_ended" }));
+      socket.send(JSON.stringify({ action: "playback_ended", turn_id: currentTurnId }));
     }
     updateMicStatus();
   }, TAIL_HANGOVER_MS);
 }
 
-function queueAudioChunk(arrayBuffer) {
+function queueAudioChunk(arrayBuffer, chunkTurnId) {
   if (!audioCtx) return;
+  if (chunkTurnId !== undefined) {
+    if (cancelledTurnIds.has(chunkTurnId) || (currentTurnId > 0 && chunkTurnId < currentTurnId)) {
+      return;
+    }
+    if (chunkTurnId > currentTurnId) {
+      currentTurnId = chunkTurnId;
+    }
+  }
   if (audioCtx.state === "suspended") {
     audioCtx.resume();
   }
@@ -626,7 +637,7 @@ function queueAudioChunk(arrayBuffer) {
   if (!wasPlaying) {
     playStartTime = performance.now();
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ action: "playback_started" }));
+      socket.send(JSON.stringify({ action: "playback_started", turn_id: currentTurnId }));
     }
   }
   updateMicStatus();
@@ -641,7 +652,11 @@ function queueAudioChunk(arrayBuffer) {
   };
 }
 
-function stopAudioPlayback() {
+function stopAudioPlayback(turnIdToCancel) {
+  const tid = turnIdToCancel || currentTurnId;
+  if (tid) {
+    cancelledTurnIds.add(tid);
+  }
   if (tailHangoverTimer) {
     clearTimeout(tailHangoverTimer);
     tailHangoverTimer = null;
@@ -659,6 +674,51 @@ function stopAudioPlayback() {
   activeSources.clear();
   nextPlayTime = 0;
   updateMicStatus();
+}
+
+function showOccupiedNotice(message) {
+  const alert = element("alert");
+  alert.replaceChildren();
+
+  const msgSpan = document.createElement("span");
+  msgSpan.textContent = message || t("session_occupied");
+
+  const takeoverBtn = document.createElement("button");
+  takeoverBtn.type = "button";
+  takeoverBtn.className = "btn-takeover";
+  takeoverBtn.id = "btn-takeover";
+  takeoverBtn.dataset.i18n = "takeover_session";
+  takeoverBtn.textContent = t("takeover_session");
+  takeoverBtn.addEventListener("click", () => {
+    handleTakeover();
+  });
+
+  alert.append(msgSpan, takeoverBtn);
+  alert.hidden = false;
+}
+
+async function handleTakeover() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  notice();
+  setState("starting");
+  try {
+    await startAudioRecording();
+    socket.send(JSON.stringify({
+      action: "takeover",
+      mode: voiceMode.value,
+      barge_in: voiceMode.value === "barge_in",
+      speaker_mode: voiceMode.value === "speaker",
+      character: charSelect ? charSelect.value : "mio",
+      voice: voiceSelect ? voiceSelect.value : "chinatsu",
+      tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
+      conversation_id: selectedConversationId,
+    }));
+  } catch (err) {
+    console.error("Failed to start audio on takeover", err);
+    notice(t("mic_error", { error: err.message || err }));
+    stopAudioRecording();
+    setState("idle");
+  }
 }
 
 async function startAudioRecording() {
@@ -898,6 +958,17 @@ function duration(ms) {
 }
 
 function onEvent(event) {
+  if (event.turn_id !== undefined) {
+    const tid = Number(event.turn_id);
+    if (cancelledTurnIds.has(tid) || (currentTurnId > 0 && tid < currentTurnId)) {
+      if (["user_partial", "assistant_partial", "timing", "output_complete", "tts_start"].includes(event.kind)) {
+        return;
+      }
+    }
+    if (tid > currentTurnId) {
+      currentTurnId = tid;
+    }
+  }
   if (event.kind === "endpoint") {
     waitingReply = true;
     serverGenerating = true;
@@ -918,6 +989,24 @@ function onEvent(event) {
   }
   switch (event.kind) {
     case "state": setState(event.state); break;
+    case "occupied":
+      isOccupied = true;
+      stopAudioRecording();
+      showOccupiedNotice(event.message_key ? t(event.message_key) : event.message);
+      setState("idle");
+      break;
+    case "taken_over":
+      isOccupied = false;
+      stopAudioRecording();
+      notice(t(event.message_key || "session_taken_over"));
+      setState("idle");
+      break;
+    case "session_status":
+      isOccupied = Boolean(event.occupied);
+      if (!isOccupied && document.getElementById("btn-takeover")) {
+        notice();
+      }
+      break;
     case "conversation":
       selectedConversationId = event.id;
       refreshConversationList();
@@ -959,6 +1048,7 @@ function onEvent(event) {
       updateMicStatus();
       break;
     case "speech_start":
+      if (event.turn_id !== undefined) currentTurnId = Number(event.turn_id);
       serverGenerating = false;
       hasPlayedAudioInTurn = false;
       notice();
@@ -1030,10 +1120,14 @@ function onEvent(event) {
       phase(t("phase_no_reply"));
       break;
     case "interrupted":
+      {
+        const interruptedId = event.turn_id ? Number(event.turn_id) : currentTurnId;
+        cancelledTurnIds.add(interruptedId);
       serverGenerating = false;
-      stopAudioPlayback();
+        stopAudioPlayback(interruptedId);
       finishDrafts();
       phase(t("phase_interrupted", { name: names.assistant }));
+      }
       break;
   }
 }
@@ -1048,7 +1142,11 @@ function connect() {
   });
   socket.addEventListener("message", (event) => {
     if (event.data instanceof ArrayBuffer) {
-      queueAudioChunk(event.data);
+      if (event.data.byteLength < 4) return;
+      const view = new DataView(event.data);
+      const chunkTurnId = view.getUint32(0);
+      const pcmBuffer = event.data.slice(4);
+      queueAudioChunk(pcmBuffer, chunkTurnId);
     } else {
       try {
         onEvent(JSON.parse(event.data));
@@ -1072,7 +1170,7 @@ button.addEventListener("click", async () => {
   if (stop) {
     setState("stopping");
     stopAudioRecording();
-    socket.send(JSON.stringify({ action: "stop" }));
+    socket.send(JSON.stringify({ action: "stop", turn_id: currentTurnId }));
   } else {
     setState("starting");
     try {
@@ -1130,7 +1228,7 @@ async function submitTextMessage() {
 
   textInput.value = "";
   if (state === "running") {
-    socket.send(JSON.stringify({ action: "text", text }));
+    socket.send(JSON.stringify({ action: "text", text, turn_id: currentTurnId }));
     phase(t("phase_llm_generating", { name: names.assistant }), "llm");
   } else if (state === "idle") {
     setState("starting");
