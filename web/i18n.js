@@ -141,7 +141,11 @@
       retry_read_aria: "重新朗读此条回复",
       tts_error_notice: "语音合成超时或失败，已保留文字回复，可点击重试朗读。",
       phase_tts_error: "语音合成失败，已保留文字",
-      mic_error: "麦克风启动失败：{error}。请检查浏览器麦克风权限。"
+      mic_error: "麦克风启动失败：{error}。请检查浏览器麦克风权限。",
+      mic_device_switched: "已切换至麦克风：{name}",
+      mic_busy_or_denied: "麦克风被占用或权限被拒绝，请检查设备权限后重试。",
+      worklet_fallback_notice: "音频工作线程加载失败，已自动降级至兼容录音模式。",
+      audio_network_lag: "网络延迟较高，已自动丢弃过期音频以保持实时同步。"
     },
     en: {
       // Page & general
@@ -284,7 +288,11 @@
       retry_read_aria: "Retry reading this reply",
       tts_error_notice: "Voice synthesis timed out or failed; text reply preserved, click to retry reading.",
       phase_tts_error: "Voice synthesis failed; text preserved",
-      mic_error: "Microphone failed to start: {error}. Please check browser microphone permissions."
+      mic_error: "Microphone failed to start: {error}. Please check browser microphone permissions.",
+      mic_device_switched: "Switched to microphone: {name}",
+      mic_busy_or_denied: "Microphone is busy or permission was denied. Please check device permissions and retry.",
+      worklet_fallback_notice: "AudioWorklet failed to load, automatically fell back to compatibility recording mode.",
+      audio_network_lag: "High network latency detected; discarded stale audio to maintain real-time sync."
     },
   };
 

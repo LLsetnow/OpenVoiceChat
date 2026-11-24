@@ -192,6 +192,10 @@ let audioCtx = null;
 let micStream = null;
 let micSource = null;
 let processor = null;
+let workletNode = null;
+let silentGain = null;
+let isUsingWorklet = false;
+let workletModuleLoaded = false;
 let isRecording = false;
 let resampleOffset = 0;
 const activeSources = new Set();
@@ -204,6 +208,146 @@ let inTailHangover = false;
 let tailHangoverTimer = null;
 const TAIL_HANGOVER_MS = 350;
 const BARGE_IN_RMS_THRESHOLD = 0.035;
+
+// Bounded audio send queue & backpressure control (~500ms queue, max ~500ms socket buffer)
+const MAX_SOCKET_BUFFERED_AMOUNT = 16384; // 16KB (~500ms at 16kHz 16-bit mono PCM)
+const MAX_PENDING_QUEUE_BYTES = 16384;    // 16KB (~500ms backlog limit)
+let pendingAudioChunks = [];
+let pendingAudioBytes = 0;
+let isFlushingAudio = false;
+let drainTimer = null;
+let audioCongestionNotified = false;
+
+const WORKLET_PROCESSOR_CODE = `
+class AudioWorkletRecorderProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const opts = (options && options.processorOptions) || {};
+    this.targetSampleRate = opts.targetSampleRate || 16000;
+    this.bufferSize = opts.bufferSize || 512;
+    this.sourceSampleRate = typeof sampleRate !== "undefined" ? sampleRate : 48000;
+    this.ratio = this.sourceSampleRate / this.targetSampleRate;
+    this.resampleOffset = 0;
+    this.leftoverSample = 0;
+    this.leftoverCount = 0;
+    this.workBuffer = new Float32Array(256);
+    this.outputBuffer = new Int16Array(this.bufferSize);
+    this.outputCount = 0;
+    this.sumSquare = 0;
+    this.sampleCount = 0;
+    this.paused = false;
+
+    this.port.onmessage = (event) => {
+      const data = event.data;
+      if (!data) return;
+      if (data.command === "pause") {
+        this.paused = true;
+      } else if (data.command === "resume") {
+        this.paused = false;
+      } else if (data.command === "flush" || data.command === "stop") {
+        this._flush();
+        this.resampleOffset = 0;
+        this.leftoverCount = 0;
+        this.leftoverSample = 0;
+      } else if (data.command === "reset") {
+        this.resampleOffset = 0;
+        this.leftoverCount = 0;
+        this.leftoverSample = 0;
+        this.outputCount = 0;
+        this.sumSquare = 0;
+        this.sampleCount = 0;
+        this.paused = false;
+      }
+    };
+  }
+
+  process(inputs, outputs, parameters) {
+    if (this.paused) return true;
+    const input = inputs[0];
+    if (!input || input.length === 0) return true;
+    let channelData = input[0];
+    if (!channelData || channelData.length === 0) return true;
+
+    if (input.length > 1) {
+      const ch0 = input[0];
+      const ch1 = input[1];
+      const mono = new Float32Array(ch0.length);
+      for (let i = 0; i < ch0.length; i++) {
+        mono[i] = (ch0[i] + ch1[i]) * 0.5;
+      }
+      channelData = mono;
+    }
+
+    const len = channelData.length;
+    for (let i = 0; i < len; i++) {
+      const s = channelData[i];
+      this.sumSquare += s * s;
+    }
+    this.sampleCount += len;
+
+    if (this.sourceSampleRate === this.targetSampleRate) {
+      for (let i = 0; i < len; i++) {
+        const s = Math.max(-1, Math.min(1, channelData[i]));
+        this.outputBuffer[this.outputCount++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        if (this.outputCount >= this.bufferSize) {
+          this._flush();
+        }
+      }
+    } else {
+      const neededLen = this.leftoverCount + len + 2;
+      if (this.workBuffer.length < neededLen) {
+        this.workBuffer = new Float32Array(neededLen);
+      }
+      if (this.leftoverCount > 0) {
+        this.workBuffer[0] = this.leftoverSample;
+        this.workBuffer.set(channelData, 1);
+      } else {
+        this.workBuffer.set(channelData, 0);
+      }
+
+      const total = this.leftoverCount + len;
+      let pos = this.resampleOffset;
+      const limit = total - 1;
+
+      while (pos < limit) {
+        const idx = Math.floor(pos);
+        const frac = pos - idx;
+        const s = this.workBuffer[idx] * (1 - frac) + this.workBuffer[idx + 1] * frac;
+        const clamped = Math.max(-1, Math.min(1, s));
+        this.outputBuffer[this.outputCount++] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+        if (this.outputCount >= this.bufferSize) {
+          this._flush();
+        }
+        pos += this.ratio;
+      }
+
+      this.leftoverSample = this.workBuffer[limit];
+      this.leftoverCount = 1;
+      this.resampleOffset = pos - limit;
+    }
+    return true;
+  }
+
+  _flush() {
+    if (this.outputCount === 0) return;
+    const rms = this.sampleCount > 0 ? Math.sqrt(this.sumSquare / this.sampleCount) : 0;
+    const chunk = new Int16Array(this.outputCount);
+    chunk.set(this.outputBuffer.subarray(0, this.outputCount));
+    this.port.postMessage(
+      {
+        type: "audio",
+        buffer: chunk.buffer,
+        rms: rms,
+      },
+      [chunk.buffer]
+    );
+    this.outputCount = 0;
+    this.sumSquare = 0;
+    this.sampleCount = 0;
+  }
+}
+registerProcessor("recorder-worklet-processor", AudioWorkletRecorderProcessor);
+`;
 
 try {
   const savedMode = localStorage.getItem(voiceModeKey);
@@ -236,9 +380,62 @@ for (const [kind, select] of Object.entries(devices)) {
     } catch {}
     if (kind === "output") {
       await applyOutputDevice(select.value);
+    } else if (kind === "input" && isRecording) {
+      await switchInputDevice(select.value);
     }
     updateControls();
   });
+}
+
+async function switchInputDevice(deviceId) {
+  try {
+    if (micSource) {
+      try { micSource.disconnect(); } catch (e) {}
+      micSource = null;
+    }
+    if (micStream) {
+      try {
+        micStream.getTracks().forEach((track) => {
+          try { track.stop(); } catch (e) {}
+        });
+      } catch (e) {}
+      micStream = null;
+    }
+
+    const constraints = {
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    };
+    if (deviceId) {
+      constraints.audio.deviceId = { ideal: deviceId };
+    }
+
+    micStream = await navigator.mediaDevices.getUserMedia(constraints);
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === "suspended") {
+      await audioCtx.resume();
+    }
+
+    micSource = audioCtx.createMediaStreamSource(micStream);
+    if (workletNode) {
+      micSource.connect(workletNode);
+    } else if (processor) {
+      micSource.connect(processor);
+    }
+    const select = devices.input;
+    const deviceName = (select && select.selectedOptions[0] ? select.selectedOptions[0].text : "") || deviceId;
+    if (deviceName) {
+      notice(t("mic_device_switched", { name: deviceName }));
+    }
+  } catch (err) {
+    console.error("Failed to switch input device:", err);
+    notice(t("mic_error", { error: err.message || err }));
+  }
 }
 
 async function applyOutputDevice(deviceId) {
@@ -661,6 +858,117 @@ function stopAudioPlayback() {
   updateMicStatus();
 }
 
+function enqueueAudioChunk(buffer) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    clearAudioQueue();
+    return;
+  }
+
+  const socketCongested = socket.bufferedAmount >= MAX_SOCKET_BUFFERED_AMOUNT;
+
+  if (socketCongested || pendingAudioChunks.length > 0) {
+    pendingAudioChunks.push(buffer);
+    pendingAudioBytes += buffer.byteLength;
+
+    let droppedBytes = 0;
+    while (pendingAudioBytes > MAX_PENDING_QUEUE_BYTES && pendingAudioChunks.length > 1) {
+      const dropped = pendingAudioChunks.shift();
+      pendingAudioBytes -= dropped.byteLength;
+      droppedBytes += dropped.byteLength;
+    }
+
+    if (droppedBytes > 0 && !audioCongestionNotified) {
+      audioCongestionNotified = true;
+      console.warn(`[AudioWorklet] Network backpressure: dropped ${droppedBytes} bytes of stale audio to maintain real-time sync.`);
+      setTimeout(() => { audioCongestionNotified = false; }, 3000);
+    }
+
+    scheduleDrainCheck();
+  } else {
+    try {
+      socket.send(buffer);
+    } catch (err) {
+      console.warn("Failed to send audio chunk:", err);
+    }
+  }
+}
+
+function flushAudioQueue() {
+  if (isFlushingAudio) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    clearAudioQueue();
+    return;
+  }
+
+  isFlushingAudio = true;
+  try {
+    while (pendingAudioChunks.length > 0) {
+      if (socket.bufferedAmount >= MAX_SOCKET_BUFFERED_AMOUNT) {
+        scheduleDrainCheck();
+        break;
+      }
+      const chunk = pendingAudioChunks.shift();
+      pendingAudioBytes -= chunk.byteLength;
+      socket.send(chunk);
+    }
+  } catch (err) {
+    console.warn("Error flushing audio queue:", err);
+  } finally {
+    isFlushingAudio = false;
+  }
+}
+
+function scheduleDrainCheck() {
+  if (drainTimer) return;
+  drainTimer = setTimeout(() => {
+    drainTimer = null;
+    flushAudioQueue();
+  }, 35);
+}
+
+function clearAudioQueue() {
+  pendingAudioChunks = [];
+  pendingAudioBytes = 0;
+  if (drainTimer) {
+    clearTimeout(drainTimer);
+    drainTimer = null;
+  }
+  isFlushingAudio = false;
+}
+
+function handleIncomingRecordedAudio(buffer, rms) {
+  if (!isRecording) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+  const isAudioPlaying = activeSources.size > 0;
+  const isInterSentencePause = hasPlayedAudioInTurn && serverGenerating && !isAudioPlaying;
+  const isSpeakerMode = voiceMode.value === "speaker";
+
+  if (isSpeakerMode) {
+    // 扬声器防回声模式：播放中、分句间停顿、播完尾音吸收期，丢弃麦克风输入
+    if (isAudioPlaying || isInterSentencePause || inTailHangover) {
+      return;
+    }
+  } else {
+    // 智能免提打断模式：
+    // 1. 如果处于尾音过滤窗口（播完 350ms 内）或分句等待间隙，坚决物理丢弃，防止尾音作为新发言被识别
+    if (inTailHangover || isInterSentencePause) {
+      return;
+    }
+    // 2. 如果正在发声播放，只有用户开口声量明显大于扬声器回声门限，才允许打断
+    if (isAudioPlaying) {
+      if (performance.now() - playStartTime < 300) {
+        return; // 播放前 300ms 瞬态过滤
+      }
+      if (rms < BARGE_IN_RMS_THRESHOLD) {
+        return; // 回声能量小，丢弃
+      }
+    }
+  }
+
+  enqueueAudioChunk(buffer);
+}
+
 async function startAudioRecording() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -687,60 +995,80 @@ async function startAudioRecording() {
 
   isRecording = true;
   resampleOffset = 0;
+  clearAudioQueue();
 
   micSource = audioCtx.createMediaStreamSource(micStream);
-  processor = audioCtx.createScriptProcessor(2048, 1, 1);
 
-  const silentGain = audioCtx.createGain();
+  silentGain = audioCtx.createGain();
   silentGain.gain.value = 0;
-  processor.connect(silentGain);
   silentGain.connect(audioCtx.destination);
 
-  processor.onaudioprocess = (e) => {
-    if (!isRecording || !socket || socket.readyState !== WebSocket.OPEN) return;
-
-    const inputData = e.inputBuffer.getChannelData(0);
-
-    // 计算当前帧 RMS 能量
-    let sum = 0;
-    for (let i = 0; i < inputData.length; i++) {
-      sum += inputData[i] * inputData[i];
-    }
-    const rms = Math.sqrt(sum / inputData.length);
-
-    const isAudioPlaying = activeSources.size > 0;
-    const isInterSentencePause = hasPlayedAudioInTurn && serverGenerating && !isAudioPlaying;
-    const isSpeakerMode = voiceMode.value === "speaker";
-
-    if (isSpeakerMode) {
-      // 扬声器防回声模式：播放中、分句间停顿、播完尾音吸收期，丢弃麦克风输入
-      if (isAudioPlaying || isInterSentencePause || inTailHangover) {
-        return;
-      }
-    } else {
-      // 智能免提打断模式：
-      // 1. 如果处于尾音过滤窗口（播完 350ms 内）或分句等待间隙，坚决物理丢弃，防止尾音作为新发言被识别
-      if (inTailHangover || isInterSentencePause) {
-        return;
-      }
-      // 2. 如果正在发声播放，只有用户开口声量明显大于扬声器回声门限，才允许打断
-      if (isAudioPlaying) {
-        if (performance.now() - playStartTime < 300) {
-          return; // 播放前 300ms 瞬态过滤
-        }
-        if (rms < BARGE_IN_RMS_THRESHOLD) {
-          return; // 回声能量小，丢弃
+  let workletStarted = false;
+  if (typeof window.AudioWorkletNode === "function" && audioCtx.audioWorklet) {
+    try {
+      if (!workletModuleLoaded) {
+        try {
+          await audioCtx.audioWorklet.addModule("assets/audio-worklet-processor.js?v=1.4.0");
+          workletModuleLoaded = true;
+        } catch (moduleErr) {
+          console.warn("Failed to load worklet module URL, trying inline blob fallback:", moduleErr);
+          const blob = new Blob([WORKLET_PROCESSOR_CODE], { type: "application/javascript" });
+          const blobUrl = URL.createObjectURL(blob);
+          await audioCtx.audioWorklet.addModule(blobUrl);
+          URL.revokeObjectURL(blobUrl);
+          workletModuleLoaded = true;
         }
       }
-    }
 
-    const pcm16 = resampleTo16k(inputData, audioCtx.sampleRate);
-    if (pcm16.length > 0) {
-      socket.send(pcm16.buffer.slice(pcm16.byteOffset, pcm16.byteOffset + pcm16.byteLength));
-    }
-  };
+      workletNode = new AudioWorkletNode(audioCtx, "recorder-worklet-processor", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        processorOptions: {
+          targetSampleRate: 16000,
+          bufferSize: 512,
+        },
+      });
 
-  micSource.connect(processor);
+      workletNode.port.onmessage = (event) => {
+        const data = event.data;
+        if (!data || data.type !== "audio") return;
+        handleIncomingRecordedAudio(data.buffer, data.rms);
+      };
+
+      micSource.connect(workletNode);
+      workletNode.connect(silentGain);
+      isUsingWorklet = true;
+      workletStarted = true;
+    } catch (err) {
+      console.warn("AudioWorklet initialization failed, falling back to ScriptProcessorNode:", err);
+      isUsingWorklet = false;
+    }
+  }
+
+  if (!workletStarted) {
+    // Graceful fallback to ScriptProcessorNode
+    processor = audioCtx.createScriptProcessor(2048, 1, 1);
+    processor.onaudioprocess = (e) => {
+      if (!isRecording) return;
+      const inputData = e.inputBuffer.getChannelData(0);
+
+      let sum = 0;
+      for (let i = 0; i < inputData.length; i++) {
+        sum += inputData[i] * inputData[i];
+      }
+      const rms = Math.sqrt(sum / inputData.length);
+
+      const pcm16 = resampleTo16k(inputData, audioCtx.sampleRate);
+      if (pcm16.length > 0) {
+        const buffer = pcm16.buffer.slice(pcm16.byteOffset, pcm16.byteOffset + pcm16.byteLength);
+        handleIncomingRecordedAudio(buffer, rms);
+      }
+    };
+
+    micSource.connect(processor);
+    processor.connect(silentGain);
+    isUsingWorklet = false;
+  }
 }
 
 function stopAudioRecording() {
@@ -749,11 +1077,26 @@ function stopAudioRecording() {
   serverGenerating = false;
   hasPlayedAudioInTurn = false;
   waitingReply = false;
+  clearAudioQueue();
+
+  if (workletNode) {
+    try {
+      workletNode.port.postMessage({ command: "stop" });
+      workletNode.disconnect();
+    } catch (e) {}
+    workletNode = null;
+  }
   if (processor) {
     try {
       processor.disconnect();
     } catch (e) {}
     processor = null;
+  }
+  if (silentGain) {
+    try {
+      silentGain.disconnect();
+    } catch (e) {}
+    silentGain = null;
   }
   if (micSource) {
     try {
@@ -762,8 +1105,17 @@ function stopAudioRecording() {
     micSource = null;
   }
   if (micStream) {
-    micStream.getTracks().forEach((track) => track.stop());
+    micStream.getTracks().forEach((track) => {
+      try {
+        track.stop();
+      } catch (e) {}
+    });
     micStream = null;
+  }
+  if (audioCtx && audioCtx.state === "running" && activeSources.size === 0) {
+    try {
+      audioCtx.suspend();
+    } catch (e) {}
   }
   stopAudioPlayback();
 }
