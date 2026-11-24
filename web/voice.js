@@ -780,18 +780,44 @@ function showMessage(role, text, draft) {
     messages.appendChild(entry);
     element("empty").hidden = true;
   }
-  entry.lastElementChild.textContent = text;
+  const body = entry.querySelector(".bubble-text") || entry.lastElementChild;
+  body.textContent = text;
   entry.dataset.draft = String(Boolean(draft));
   if (draft) {
     drafts.set(role, entry);
   } else {
     drafts.delete(role);
+    if (role === "assistant") {
+      addRetryButtonToBubble(entry, text);
+    }
   }
   if (follow) {
     cancelAnimationFrame(scrollFrame);
     scrollFrame = requestAnimationFrame(() => {
       scroller.scrollTop = scroller.scrollHeight;
     });
+  }
+}
+
+function addRetryButtonToBubble(entry, text) {
+  if (entry.dataset.role !== "assistant") return;
+  let actions = entry.querySelector(".bubble-actions");
+  if (!actions) {
+    actions = document.createElement("div");
+    actions.className = "bubble-actions";
+    const retryBtn = document.createElement("button");
+    retryBtn.type = "button";
+    retryBtn.className = "btn-retry-speak";
+    retryBtn.dataset.i18n = "retry_read";
+    retryBtn.dataset.i18nTitle = "retry_read_aria";
+    retryBtn.title = t("retry_read_aria");
+    retryBtn.textContent = t("retry_read");
+    retryBtn.addEventListener("click", () => {
+      const body = entry.querySelector(".bubble-text");
+      retrySpeakText(body ? body.textContent : text);
+    });
+    actions.appendChild(retryBtn);
+    entry.appendChild(actions);
   }
 }
 
@@ -808,8 +834,12 @@ function renderConversationMessages(history) {
 }
 
 function finishDrafts() {
-  for (const draft of drafts.values()) {
+  for (const [role, draft] of drafts.entries()) {
     draft.dataset.draft = "false";
+    if (role === "assistant") {
+      const body = draft.querySelector(".bubble-text");
+      addRetryButtonToBubble(draft, body ? body.textContent : "");
+    }
   }
   drafts.clear();
 }
@@ -830,7 +860,7 @@ function onEvent(event) {
     waitingReply = true;
     serverGenerating = true;
     updateMicStatus();
-  } else if (["error", "no_speech", "empty_reply", "interrupted"].includes(event.kind)) {
+  } else if (["error", "tts_error", "no_speech", "empty_reply", "interrupted"].includes(event.kind)) {
     if (tailHangoverTimer) {
       clearTimeout(tailHangoverTimer);
       tailHangoverTimer = null;
@@ -863,6 +893,17 @@ function onEvent(event) {
       updateControls();
       break;
     case "error": notice(event.message || (event.message_key ? t(event.message_key) : "")); finishDrafts(); phase(""); break;
+    case "tts_error":
+      notice(event.message || (event.message_key ? t(event.message_key) : t("tts_error_notice")));
+      phase(t("phase_tts_error"), "tts");
+      serverGenerating = false;
+      waitingReply = false;
+      const lastAsst = messages.querySelector('.bubble[data-role="assistant"]:last-of-type');
+      if (lastAsst) {
+        lastAsst.dataset.ttsError = "true";
+      }
+      updateMicStatus();
+      break;
     case "speech_start":
       serverGenerating = false;
       hasPlayedAudioInTurn = false;
@@ -1050,6 +1091,49 @@ async function submitTextMessage() {
       voice: voiceSelect ? voiceSelect.value : "chinatsu",
       tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
       conversation_id: selectedConversationId,
+    }));
+  }
+}
+
+async function retrySpeakText(text) {
+  if (!text || typeof text !== "string") return;
+  const trimmed = text.trim();
+  if (!trimmed) return;
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    notice(t("state_offline"));
+    return;
+  }
+
+  notice();
+  phase(t("phase_tts_synthesizing", { name: names.assistant }), "tts");
+  const payload = {
+    action: "retry_speak",
+    text: trimmed,
+    character: charSelect ? charSelect.value : "mio",
+    voice: voiceSelect ? voiceSelect.value : "chinatsu",
+    tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
+    conversation_id: selectedConversationId,
+  };
+
+  if (state === "running") {
+    socket.send(JSON.stringify(payload));
+  } else if (state === "idle") {
+    setState("starting");
+    try {
+      await startAudioRecording();
+    } catch (err) {
+      console.warn("Audio recording init warning:", err);
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === "suspended") await audioCtx.resume();
+      } catch (e) {}
+    }
+    socket.send(JSON.stringify({
+      ...payload,
+      mode: voiceMode.value,
+      barge_in: voiceMode.value === "barge_in",
+      speaker_mode: voiceMode.value === "speaker",
     }));
   }
 }

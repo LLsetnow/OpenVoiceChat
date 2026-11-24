@@ -133,6 +133,10 @@
       phase_can_continue: "可以继续说话",
       phase_no_reply: "这轮没有生成回复，可以继续说话",
       phase_interrupted: "已打断，{name}正在聆听",
+      retry_read: "重试朗读",
+      retry_read_aria: "重新朗读此条回复",
+      tts_error_notice: "语音合成超时或失败，已保留文字回复，可点击重试朗读。",
+      phase_tts_error: "语音合成失败，已保留文字",
       mic_error: "麦克风启动失败：{error}。请检查浏览器麦克风权限。"
     },
     en: {
@@ -268,6 +272,10 @@
       phase_can_continue: "Ready for more speech",
       phase_no_reply: "No reply generated this turn, please speak again",
       phase_interrupted: "Interrupted, {name} is listening",
+      retry_read: "Retry Voice",
+      retry_read_aria: "Retry reading this reply",
+      tts_error_notice: "Voice synthesis timed out or failed; text reply preserved, click to retry reading.",
+      phase_tts_error: "Voice synthesis failed; text preserved",
       mic_error: "Microphone failed to start: {error}. Please check browser microphone permissions."
     },
   };
