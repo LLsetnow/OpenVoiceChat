@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f3f5ef">
   <title>语音对话 · OpenVoiceChat</title>
-  <link rel="stylesheet" href="assets/voice.css?v=1.2.1">
-  <script src="assets/i18n.js?v=1.2.2" defer></script>
-  <script src="assets/voice.js?v=1.3.3" defer></script>
+  <link rel="stylesheet" href="assets/voice.css?v=1.2.2">
+  <script src="assets/i18n.js?v=1.2.3" defer></script>
+  <script src="assets/voice.js?v=1.3.4" defer></script>
 </head>
 <body>
   <div class="page">
@@ -115,6 +115,26 @@
           </div>
           <div class="messages" id="messages"></div>
         </div>
+        <form class="text-input-form" id="text-form">
+          <input
+            type="text"
+            id="text-input"
+            class="text-input"
+            autocomplete="off"
+            placeholder="输入文字向千夏提问…（Enter 发送）"
+            data-i18n-placeholder="text_input_placeholder"
+            data-i18n-aria-label="text_input_aria"
+            aria-label="文字输入框"
+          >
+          <button
+            type="submit"
+            id="text-send-btn"
+            class="text-send-btn"
+            data-i18n="send_text_button"
+            data-i18n-title="send_text_title"
+            title="发送文字（Enter）"
+          >发送</button>
+        </form>
         <footer class="panel-footer" id="mic-hint" data-i18n="mic_hint_default">免提监听中，千夏说话时可随时开口打断。</footer>
       </section>
 

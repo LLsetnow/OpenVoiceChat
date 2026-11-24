@@ -16,6 +16,9 @@ const voiceSelect = element("voice-select");
 const historyList = element("history-list");
 const newConversationButton = element("new-conversation");
 const langToggle = element("lang-toggle");
+const textForm = element("text-form");
+const textInput = element("text-input");
+const textSendBtn = element("text-send-btn");
 const avatars = () => document.querySelectorAll("[data-avatar]");
 function setAvatar(src) {
   if (src && typeof src === "string" && src.startsWith("/assets/")) {
@@ -265,6 +268,14 @@ function updateControls() {
     for (const item of historyList.querySelectorAll("button")) {
       item.disabled = state !== "idle";
     }
+  }
+  if (textSendBtn) {
+    const isSocketOpen = socket && socket.readyState === WebSocket.OPEN;
+    textSendBtn.disabled = !isSocketOpen || state === "starting" || state === "stopping";
+  }
+  if (textInput) {
+    const isSocketOpen = socket && socket.readyState === WebSocket.OPEN;
+    textInput.disabled = !isSocketOpen || state === "stopping";
   }
 }
 
@@ -897,7 +908,9 @@ function onEvent(event) {
         element("llm-sub").textContent = t("metric_first_token", { ms: duration(event.milliseconds) });
       } else if (stageNames.includes(event.stage)) {
         element(`${event.stage}-row`).dataset.pending = "false";
-        element(event.stage).textContent = duration(event.milliseconds);
+        element(event.stage).textContent = (event.stage === "asr" && event.milliseconds === 0)
+          ? t("metric_text_input")
+          : duration(event.milliseconds);
         if (event.stage === "tts") phase("");
       }
       break;
@@ -927,6 +940,7 @@ function connect() {
   socket.addEventListener("open", () => {
     socket.send(JSON.stringify({ action: "init" }));
     requestDevices();
+    updateControls();
   });
   socket.addEventListener("message", (event) => {
     if (event.data instanceof ArrayBuffer) {
@@ -986,6 +1000,60 @@ window.addEventListener("beforeunload", () => {
 });
 
 refresh.addEventListener("click", requestDevices);
+
+let isComposing = false;
+if (textInput) {
+  textInput.addEventListener("compositionstart", () => { isComposing = true; });
+  textInput.addEventListener("compositionend", () => { isComposing = false; });
+}
+if (textForm) {
+  textForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (isComposing) return;
+    submitTextMessage();
+  });
+}
+
+async function submitTextMessage() {
+  if (!textInput) return;
+  const text = textInput.value.trim();
+  if (!text) return;
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    notice(t("state_offline"));
+    return;
+  }
+
+  textInput.value = "";
+  if (state === "running") {
+    socket.send(JSON.stringify({ action: "text", text }));
+    phase(t("phase_llm_generating", { name: names.assistant }), "llm");
+  } else if (state === "idle") {
+    setState("starting");
+    notice();
+    try {
+      await startAudioRecording();
+    } catch (err) {
+      console.warn("Audio recording init warning:", err);
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === "suspended") await audioCtx.resume();
+      } catch (e) {}
+    }
+    socket.send(JSON.stringify({
+      action: "start",
+      text: text,
+      mode: voiceMode.value,
+      barge_in: voiceMode.value === "barge_in",
+      speaker_mode: voiceMode.value === "speaker",
+      character: charSelect ? charSelect.value : "mio",
+      voice: voiceSelect ? voiceSelect.value : "chinatsu",
+      tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
+      conversation_id: selectedConversationId,
+    }));
+  }
+}
+
 populateCharacters(charactersData);
 updateVoiceOptions();
 fetchVoicesAndCharacters();

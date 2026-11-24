@@ -274,7 +274,24 @@ class Conversation:
             self.input.put_nowait(b"")
         self.resume_input()
 
-    async def _turn(self, pcm: bytes, asr_task: asyncio.Task[str] | None = None) -> None:
+    async def send_text(self, text: str) -> None:
+        """Process a text turn from the user."""
+        text = text.strip()
+        if not text or self._stop.is_set():
+            return
+        if self._turn_task is not None or self.agent_speaking:
+            await self._interrupt()
+        _drain(self.input)
+        self._need_reset = True
+        self._turn_task = asyncio.create_task(self._turn(text=text))
+
+    async def _turn(
+        self,
+        pcm: bytes = b"",
+        asr_task: asyncio.Task[str] | None = None,
+        *,
+        text: str | None = None,
+    ) -> None:
         spoken: list[str] = []
         sentences: asyncio.Queue[str | None] = asyncio.Queue(maxsize=16)
         tts_task: asyncio.Task | None = None
@@ -282,18 +299,25 @@ class Conversation:
         stream = None
         completed = False
         started = time.monotonic()
-        self._log(
-            f"turn start | pcm={len(pcm) / 2 / self.config.sample_rate * 1000:.0f}ms"
-        )
-        try:
-            stt_started = time.monotonic()
-            text = await asr_task if asr_task is not None else await self.speech.transcribe(pcm)
-            text = text.strip()
-            asr_ms = round(1000 * (time.monotonic() - stt_started))
+        if text is not None:
+            self._log(f"turn start | text={text!r}")
+        else:
             self._log(
-                f"STT ({asr_ms}ms): {text!r}"
+                f"turn start | pcm={len(pcm) / 2 / self.config.sample_rate * 1000:.0f}ms"
             )
-            self._event("timing", stage="asr", milliseconds=asr_ms)
+        try:
+            if text is None:
+                stt_started = time.monotonic()
+                text = await asr_task if asr_task is not None else await self.speech.transcribe(pcm)
+                text = text.strip()
+                asr_ms = round(1000 * (time.monotonic() - stt_started))
+                self._log(
+                    f"STT ({asr_ms}ms): {text!r}"
+                )
+                self._event("timing", stage="asr", milliseconds=asr_ms)
+            else:
+                text = text.strip()
+                self._event("timing", stage="asr", milliseconds=0)
             if not text:
                 self.agent_speaking = False
                 self.input_paused = False
@@ -407,6 +431,8 @@ class Conversation:
             if not self._stop.is_set():
                 # Ordered after all PCM in this reply, including pauses between sentences.
                 await self.output.put(None)
+            with contextlib.suppress(asyncio.QueueFull):
+                self.input.put_nowait(b"")
 
     async def _speak(self, sentences: asyncio.Queue, spoken: list[str], llm_started: float) -> None:
         first_segment = True
