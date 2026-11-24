@@ -25,8 +25,9 @@ function setAvatar(src) {
 }
 const charNameDisplay = element("char-name-display");
 
-const apiBase = (location.port === "18768" || !location.port) ? "" : "http://127.0.0.1:18768";
-const wsHost = (location.port === "18768" || !location.port) ? location.host : "127.0.0.1:18768";
+const isLocalServer = location.protocol !== "file:" && (location.port === "18768" || !location.port);
+const apiBase = isLocalServer ? "" : "http://127.0.0.1:18768";
+const wsHost = (isLocalServer && location.host) ? location.host : "127.0.0.1:18768";
 
 let charactersData = [
   { id: "mio", name: "千夏", avatar: "assets/img/chinatsu.png", voice: "chinatsu", tts_engine: "gpt_sovits" }
@@ -159,10 +160,6 @@ if (ttsEngineSelect) {
     updateVoiceOptions();
   });
 }
-
-populateCharacters(charactersData);
-updateVoiceOptions();
-fetchVoicesAndCharacters();
 
 const drafts = new Map();
 const devices = { input: element("audio-input"), output: element("audio-output") };
@@ -357,12 +354,14 @@ function startNewConversation() {
 newConversationButton?.addEventListener("click", startNewConversation);
 
 function updateMicStatus() {
-  const isAudioPlaying = activeSources.size > 0;
-  const isInterSentencePause = hasPlayedAudioInTurn && serverGenerating && !isAudioPlaying;
-  const isSpeakerMode = voiceMode.value === "speaker";
-  const shouldPause = isSpeakerMode && (isAudioPlaying || isInterSentencePause || inTailHangover);
+  const isAudioPlaying = typeof activeSources !== "undefined" && activeSources ? activeSources.size > 0 : false;
+  const isInterSentencePause = typeof hasPlayedAudioInTurn !== "undefined" && hasPlayedAudioInTurn && typeof serverGenerating !== "undefined" && serverGenerating && !isAudioPlaying;
+  const isSpeakerMode = typeof voiceMode !== "undefined" && voiceMode ? voiceMode.value === "speaker" : true;
+  const inHangover = typeof inTailHangover !== "undefined" ? inTailHangover : false;
+  const shouldPause = isSpeakerMode && (isAudioPlaying || isInterSentencePause || inHangover);
 
-  element("session-state").dataset.paused = String(shouldPause);
+  const sessionStateEl = element("session-state");
+  if (sessionStateEl) sessionStateEl.dataset.paused = String(shouldPause);
 
   const asstName = names.assistant || t("assistant_default_name");
   if (state === "running") {
@@ -987,6 +986,9 @@ window.addEventListener("beforeunload", () => {
 });
 
 refresh.addEventListener("click", requestDevices);
+populateCharacters(charactersData);
+updateVoiceOptions();
+fetchVoicesAndCharacters();
 updateMicStatus();
 connect();
 
