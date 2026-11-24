@@ -31,10 +31,34 @@ class FakeSpeech:
         pass
 
 
+class FailingSpeech:
+    def __init__(self, fail_on_first=True, fail_exc=None):
+        self.fail_on_first = fail_on_first
+        self.fail_exc = fail_exc or TimeoutError("TTS synthesis timed out")
+        self.synthesize_calls = 0
+        self.transcribe_calls = 0
+
+    async def transcribe(self, pcm16: bytes) -> str:
+        self.transcribe_calls += 1
+        return "hello"
+
+    async def synthesize(self, text: str) -> bytes:
+        self.synthesize_calls += 1
+        if self.fail_exc is not None and (self.fail_on_first or self.synthesize_calls > 1):
+            raise self.fail_exc
+        return b"\x02\x00" * 1600
+
+    async def aclose(self) -> None:
+        pass
+
+
 class FakeCompletions:
+    def __init__(self, tokens=("Hi ", "there.")):
+        self.tokens = tokens
+
     async def create(self, **kwargs):
         async def stream():
-            for token in ("Hi ", "there."):
+            for token in self.tokens:
                 yield SimpleNamespace(
                     choices=[SimpleNamespace(delta=SimpleNamespace(content=token))]
                 )
@@ -43,8 +67,8 @@ class FakeCompletions:
 
 
 class FakeClient:
-    def __init__(self):
-        self.chat = SimpleNamespace(completions=FakeCompletions())
+    def __init__(self, tokens=("Hi ", "there.")):
+        self.chat = SimpleNamespace(completions=FakeCompletions(tokens=tokens))
 
 
 def make_config() -> Config:
@@ -57,13 +81,14 @@ def make_config() -> Config:
     )
 
 
-def make_conversation(events, speech=None) -> Conversation:
+def make_conversation(events, speech=None, on_event=None, client=None) -> Conversation:
     return Conversation(
         speech or FakeSpeech(),
         system_prompt="You are helpful.",
         config=make_config(),
-        client=FakeClient(),
+        client=client or FakeClient(),
         on_turn=lambda role, text: events.append((role, text)),
+        on_event=on_event,
         vad=FakeVAD(),
     )
 
@@ -183,5 +208,187 @@ async def test_send_text_produces_audio_and_turn():
     await wait_for_role(events, "assistant")
     assert ("user", "Hello from text") in events
     assert ("assistant", "Hi there.") in events
+
+    await stop(conv, run_task)
+
+
+async def test_tts_timeout_preserves_text_and_context_and_allows_next_turn():
+    events = []
+    recorded_events = []
+    speech = FailingSpeech(fail_on_first=True, fail_exc=TimeoutError("TTS synthesis timed out"))
+    conv = make_conversation(
+        events,
+        speech=speech,
+        on_event=lambda kind, **data: recorded_events.append((kind, data)),
+    )
+    run_task = asyncio.create_task(conv.run())
+
+    await conv.send_text("Hello with TTS timeout")
+    await wait_for_role(events, "assistant")
+
+    assert ("user", "Hello with TTS timeout") in events
+    assert ("assistant", "Hi there.") in events
+    assert conv.messages[-1] == {"role": "assistant", "content": "Hi there."}
+
+    tts_errors = [data for kind, data in recorded_events if kind == "tts_error"]
+    assert len(tts_errors) >= 1
+    assert "TTS synthesis timed out" in tts_errors[0]["error"]
+
+    end_marker = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert end_marker is None
+
+    assert conv.agent_speaking is False
+    assert conv.input_paused is False
+
+    # Second turn succeeds normally
+    speech.fail_exc = None
+    await conv.send_text("How are you?")
+    chunk = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert len(chunk) == 3200
+
+    while len([e for e in events if e[0] == "assistant"]) < 2:
+        await asyncio.sleep(0.005)
+
+    assert len(conv.messages) == 5
+    assert [m["role"] for m in conv.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert conv.messages[2]["content"] == "Hi there."
+    assert conv.messages[4]["content"] == "Hi there."
+
+    await stop(conv, run_task)
+
+
+async def test_tts_failure_after_partial_audio_preserves_full_reply():
+    events = []
+    recorded_events = []
+    speech = FailingSpeech(fail_on_first=False, fail_exc=RuntimeError("TTS second chunk failed"))
+    client = FakeClient(tokens=("First sentence. ", "Second sentence."))
+    conv = make_conversation(
+        events,
+        speech=speech,
+        client=client,
+        on_event=lambda kind, **data: recorded_events.append((kind, data)),
+    )
+    run_task = asyncio.create_task(conv.run())
+
+    await conv.send_text("Multi-sentence turn")
+    first_chunk = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert len(first_chunk) == 3200
+
+    await wait_for_role(events, "assistant")
+    assert ("assistant", "First sentence. Second sentence.") in events
+    assert conv.messages[-1]["content"] == "First sentence. Second sentence."
+
+    end_marker = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert end_marker is None
+
+    tts_errors = [data for kind, data in recorded_events if kind == "tts_error"]
+    assert len(tts_errors) >= 1
+    assert "TTS second chunk failed" in tts_errors[0]["error"]
+
+    await stop(conv, run_task)
+
+
+async def test_retry_speak_replays_speech_without_duplicating_history():
+    events = []
+    recorded_events = []
+    speech = FailingSpeech(fail_on_first=True, fail_exc=TimeoutError("Initial timeout"))
+    conv = make_conversation(
+        events,
+        speech=speech,
+        on_event=lambda kind, **data: recorded_events.append((kind, data)),
+    )
+    run_task = asyncio.create_task(conv.run())
+
+    await conv.send_text("Please say hi")
+    await wait_for_role(events, "assistant")
+
+    msg_count_before = len(conv.messages)
+    assistant_events_before = [e for e in events if e[0] == "assistant"]
+    assert len(assistant_events_before) == 1
+
+    end_marker = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert end_marker is None
+
+    # Now retry speaking: speech will succeed
+    speech.fail_exc = None
+    speech.synthesize_calls = 0
+    await conv.retry_speak()
+
+    chunk = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert len(chunk) == 3200
+    end_marker2 = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert end_marker2 is None
+
+    # History and events must not be duplicated
+    assert len(conv.messages) == msg_count_before
+    assistant_events_after = [e for e in events if e[0] == "assistant"]
+    assert len(assistant_events_after) == 1
+
+    # Test explicit text retry
+    await conv.retry_speak("Replay this specific sentence.")
+    chunk2 = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert len(chunk2) == 3200
+    assert len(conv.messages) == msg_count_before
+    assert len([e for e in events if e[0] == "assistant"]) == 1
+
+    await stop(conv, run_task)
+
+
+async def test_saved_conversation_history_persistence_on_tts_failure_and_retry(tmp_path, monkeypatch):
+    from openvoicechat import history
+    from openvoicechat import migrate as history_migrations
+
+    database_dir = tmp_path / "conv-db"
+    database = database_dir / "conversations.sqlite3"
+    monkeypatch.setattr(history, "DATA_DIR", database_dir)
+    monkeypatch.setattr(history, "DATABASE", database)
+    monkeypatch.setattr(history_migrations, "DATA_DIR", database_dir)
+    monkeypatch.setattr(history_migrations, "DATABASE", database)
+    history_migrations.migrate()
+
+    saved = history.create_conversation("mio", "千夏")
+    conv_id = saved["id"]
+
+    events = []
+    speech = FailingSpeech(fail_on_first=True, fail_exc=TimeoutError("TTS timeout"))
+
+    def on_turn(role, text):
+        events.append((role, text))
+        history.append_message(conv_id, role, text)
+
+    conv = Conversation(
+        speech,
+        system_prompt="You are helpful.",
+        config=make_config(),
+        client=FakeClient(),
+        on_turn=on_turn,
+        vad=FakeVAD(),
+    )
+    run_task = asyncio.create_task(conv.run())
+
+    await conv.send_text("Hello database")
+    await wait_for_role(events, "assistant")
+
+    resumed = history.get_conversation(conv_id)
+    assert resumed is not None
+    assert [(m["role"], m["content"]) for m in resumed["messages"]] == [
+        ("user", "Hello database"),
+        ("assistant", "Hi there."),
+    ]
+
+    # Now retry speaking: history remains single user + single assistant
+    speech.fail_exc = None
+    await conv.retry_speak()
+    chunk = await asyncio.wait_for(conv.output.get(), timeout=2)
+    assert len(chunk) == 3200
+
+    resumed_after = history.get_conversation(conv_id)
+    assert len(resumed_after["messages"]) == 2
 
     await stop(conv, run_task)
