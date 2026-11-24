@@ -27,7 +27,56 @@ DEFAULT_PROMPT = (
 
 
 class VoiceConfigurationError(ValueError):
-    pass
+    def __init__(self, message: str, missing_keys: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.missing_keys = missing_keys or []
+
+
+def normalize_language(language: str | None) -> str:
+    """Normalize language code to one of: 'auto', 'zh', 'en'."""
+    if not language:
+        return "auto"
+    val = str(language).strip().lower()
+    if val in ("zh", "zh-cn", "chinese", "zh_cn"):
+        return "zh"
+    if val in ("en", "en-us", "english", "en_us"):
+        return "en"
+    if val in ("auto", "all"):
+        return "auto"
+    return "auto"
+
+
+def inject_language_instruction(prompt: str, language: str) -> str:
+    """Inject language policy instruction into system prompt."""
+    lang = normalize_language(language)
+    base = (prompt or "").rstrip()
+    if lang == "zh":
+        instruction = (
+            "\n\n【语言模式要求】无论用户使用何种语言提问（包括英文），你必须且只能使用自然、流利的中文进行回复。"
+        )
+    elif lang == "en":
+        instruction = (
+            "\n\n【Language Requirement】Regardless of what language the user speaks (including Chinese), "
+            "you must strictly and entirely reply in natural, fluent English. Do not use Chinese or other languages."
+        )
+    else:
+        instruction = (
+            "\n\n【语言模式要求】请根据用户当前提问的语言对等回复：用户使用英文提问则使用英文回答，用户使用中文提问则使用中文回答。"
+        )
+    return base + instruction
+
+
+def resolve_tts_language(tts_engine: str, voice: str, language: str) -> tuple[str, str | None]:
+    """Resolve TTS engine language and check compatibility."""
+    val = (language or "").strip().lower()
+    if val in ("zh", "zh-cn", "chinese", "zh_cn"):
+        return "zh", None
+    if val in ("en", "en-us", "english", "en_us"):
+        return "en", None
+    if val in ("auto", "all", ""):
+        return "auto", None
+
+    return "auto", "tts_lang_fallback"
 
 
 def voice_profile(
@@ -40,8 +89,10 @@ def voice_profile(
         if not value
     ]
     if missing:
+        missing_str = ", ".join(missing)
         raise VoiceConfigurationError(
-            f"缺少环境变量：{', '.join(missing)}。请在启动终端中导出，或设在项目的 .env 文件中。"
+            f"缺少环境变量：{missing_str}。请在启动终端中导出，或设在项目的 .env 文件中。",
+            missing_keys=missing,
         )
 
     config = Config(

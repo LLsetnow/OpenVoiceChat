@@ -29,7 +29,14 @@ from openvoicechat.history import (
     update_conversation_summary,
 )
 from openvoicechat.migrate import DatabaseMigrationError, migrate
-from run_voice_chat import DEFAULT_PROMPT, VoiceConfigurationError, voice_profile
+from run_voice_chat import (
+    DEFAULT_PROMPT,
+    VoiceConfigurationError,
+    inject_language_instruction,
+    normalize_language,
+    resolve_tts_language,
+    voice_profile,
+)
 
 WEB_DIR = Path(__file__).parent / "web"
 PORT = 18768
@@ -207,7 +214,7 @@ async def api_voices():
 
 
 @app.websocket("/session")
-async def session(websocket: WebSocket):
+async def session(websocket: WebSocket, language: str = "auto"):
     origin = websocket.headers.get("origin") or ""
     host = websocket.headers.get("host") or ""
     allowed = origin == f"http://{host}" or origin.startswith(
@@ -223,6 +230,7 @@ async def session(websocket: WebSocket):
     output_task: asyncio.Task | None = None
     conversation: Conversation | None = None
     input_buffer = bytearray()
+    active_session_language = normalize_language(language)
 
     async def safe_send_json(data: dict) -> None:
         async with send_lock:
@@ -272,7 +280,13 @@ async def session(websocket: WebSocket):
 
     def on_turn(conversation_id: str, role: str, text: str) -> None:
         if role == "error":
-            publish("error", message="本轮对话失败，请再说一次。")
+            publish(
+                "error",
+                error_key="turn_failed",
+                message_key="turn_failed",
+                message="本轮对话失败，请再说一次。",
+                message_en="Conversation turn failed, please try speaking again.",
+            )
         else:
             try:
                 append_message(conversation_id, role, text)
@@ -288,9 +302,10 @@ async def session(websocket: WebSocket):
         conversation_id: str | None = None,
         initial_text: str | None = None,
         initial_speak_text: str | None = None,
+        language: str | None = None,
     ) -> None:
         global active_session_stop
-        nonlocal voice_task, output_task, conversation
+        nonlocal voice_task, output_task, conversation, active_session_language
         if audio_in_use.locked():
             if active_session_stop is not None and active_session_stop is not stop_voice:
                 log.info("Stopping prior active voice session...")
@@ -300,7 +315,13 @@ async def session(websocket: WebSocket):
                         break
                     await asyncio.sleep(0.04)
             if audio_in_use.locked():
-                publish("error", message="对话正在另一个页面使用，请先在那里停止。")
+                publish(
+                    "error",
+                    error_key="session_occupied",
+                    message_key="session_occupied",
+                    message="对话正在另一个页面使用，请先在那里停止。",
+                    message_en="Conversation is currently in use in another tab. Please stop it there first.",
+                )
                 publish("state", state="idle")
                 return
         active_session_stop = stop_voice
@@ -435,8 +456,14 @@ async def session(websocket: WebSocket):
             publish("state", state="idle")
             return
 
-        chosen_prompt = char.system_prompt or DEFAULT_PROMPT
+        chosen_language = normalize_language(language or active_session_language or "auto")
+        active_session_language = chosen_language
+        chosen_prompt = inject_language_instruction(char.system_prompt or DEFAULT_PROMPT, chosen_language)
         chosen_name = char.name or "Mio"
+
+        tts_lang, lang_notice = resolve_tts_language(chosen_engine, chosen_voice, chosen_language)
+        if lang_notice:
+            publish("notice", message_key=lang_notice, lang=chosen_language, fallback=tts_lang)
 
         publish(
             "character_info",
@@ -444,6 +471,7 @@ async def session(websocket: WebSocket):
             avatar=char.avatar,
             voice=chosen_voice,
             tts_engine=chosen_engine,
+            language=chosen_language,
         )
 
         async def run_session():
@@ -453,7 +481,7 @@ async def session(websocket: WebSocket):
                     publish("state", state="starting")
                     config, speech = voice_profile(
                         voice=chosen_voice,
-                        language="zh",
+                        language=tts_lang,
                         on_partial=lambda text: publish("user_partial", text=text),
                         tts_steps=websocket.app.state.tts_steps,
                         tts_engine=chosen_engine,
@@ -490,12 +518,27 @@ async def session(websocket: WebSocket):
                     finally:
                         await speech.aclose()
             except VoiceConfigurationError as exc:
-                publish("error", message=str(exc))
+                missing_str = ", ".join(getattr(exc, "missing_keys", [])) or str(exc)
+                publish(
+                    "error",
+                    error_key="missing_configuration",
+                    message_key="missing_configuration",
+                    missing=missing_str,
+                    message=f"缺少环境变量：{missing_str}。请在启动终端中导出，或设在项目的 .env 文件中。",
+                    message_en=f"Missing environment variables: {missing_str}. Please export them or set in .env.",
+                )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 log.exception("Voice session failed")
-                publish("error", message="运行语音对话遇到错误，请刷新后重试。")
+                publish(
+                    "error",
+                    error_key="session_runtime_error",
+                    message_key="session_runtime_error",
+                    detail=str(exc),
+                    message="运行语音对话遇到错误，请刷新后重试。",
+                    message_en="Voice session encountered an error. Please refresh and try again.",
+                )
             finally:
                 publish("state", state="idle")
 
@@ -546,9 +589,16 @@ async def session(websocket: WebSocket):
                 if action == "devices":
                     try:
                         publish("devices", **audio_devices(refresh=not audio_in_use.locked()))
-                    except Exception:
+                    except Exception as exc:
                         log.exception("Could not list local audio devices")
-                        publish("devices_error", message="无法识别音频设备，请检查设备连接后刷新。")
+                        publish(
+                            "devices_error",
+                            error_key="devices_scan_failed",
+                            message_key="devices_scan_failed",
+                            detail=str(exc),
+                            message="无法识别音频设备，请检查设备连接后刷新。",
+                            message_en="Failed to detect audio devices. Please check connections and refresh.",
+                        )
                     chars = list_characters()
                     cur_char = get_default_character()
                     publish("characters", characters=chars, current=cur_char.name)
@@ -571,6 +621,9 @@ async def session(websocket: WebSocket):
                         initial_text = None
                     else:
                         initial_text = initial_text.strip()
+                    lang = command.get("language")
+                    if lang:
+                        active_session_language = normalize_language(lang)
                     await start_voice(
                         barge_in,
                         character_id=char_id,
@@ -578,12 +631,45 @@ async def session(websocket: WebSocket):
                         engine_override=e_override,
                         conversation_id=selected_conversation,
                         initial_text=initial_text,
+                        language=active_session_language,
                     )
+                elif action == "set_language":
+                    new_lang = normalize_language(command.get("language"))
+                    active_session_language = new_lang
+                    if conversation is not None and not conversation._stop.is_set():
+                        char = get_default_character()
+                        conversation.system_prompt = inject_language_instruction(
+                            char.system_prompt or DEFAULT_PROMPT, new_lang
+                        )
+                        tts_l, notice = resolve_tts_language(
+                            getattr(conversation.speech, "tts_engine", "gpt_sovits"),
+                            getattr(conversation.speech, "voice", "chinatsu"),
+                            new_lang,
+                        )
+                        if notice:
+                            publish("notice", message_key=notice, lang=new_lang, fallback=tts_l)
+                        if hasattr(conversation.speech, "language"):
+                            conversation.speech.language = tts_l
+                    publish("language_changed", language=new_lang)
                 elif action == "text":
                     text_content = command.get("text")
                     if isinstance(text_content, str) and text_content.strip():
                         text_content = text_content.strip()
                         if conversation is not None and not conversation._stop.is_set():
+                            lang = command.get("language")
+                            if lang:
+                                active_session_language = normalize_language(lang)
+                                char = get_default_character()
+                                conversation.system_prompt = inject_language_instruction(
+                                    char.system_prompt or DEFAULT_PROMPT, active_session_language
+                                )
+                                tts_l, _ = resolve_tts_language(
+                                    getattr(conversation.speech, "tts_engine", "gpt_sovits"),
+                                    getattr(conversation.speech, "voice", "chinatsu"),
+                                    active_session_language,
+                                )
+                                if hasattr(conversation.speech, "language"):
+                                    conversation.speech.language = tts_l
                             await conversation.send_text(text_content)
                         elif voice_task is None or voice_task.done():
                             mode = command.get("mode")
@@ -598,6 +684,9 @@ async def session(websocket: WebSocket):
                             selected_conversation = command.get("conversation_id")
                             if not isinstance(selected_conversation, str):
                                 selected_conversation = None
+                            lang = command.get("language")
+                            if lang:
+                                active_session_language = normalize_language(lang)
                             await start_voice(
                                 barge_in,
                                 character_id=char_id,
@@ -605,6 +694,7 @@ async def session(websocket: WebSocket):
                                 engine_override=e_override,
                                 conversation_id=selected_conversation,
                                 initial_text=text_content,
+                                language=active_session_language,
                             )
                 elif action == "retry_speak":
                     text_content = command.get("text")
@@ -623,6 +713,9 @@ async def session(websocket: WebSocket):
                         selected_conversation = command.get("conversation_id")
                         if not isinstance(selected_conversation, str):
                             selected_conversation = None
+                        lang = command.get("language")
+                        if lang:
+                            active_session_language = normalize_language(lang)
                         await start_voice(
                             barge_in,
                             character_id=char_id,
@@ -630,6 +723,7 @@ async def session(websocket: WebSocket):
                             engine_override=e_override,
                             conversation_id=selected_conversation,
                             initial_speak_text=text_content,
+                            language=active_session_language,
                         )
                 elif action == "playback_started":
                     if conversation is not None:

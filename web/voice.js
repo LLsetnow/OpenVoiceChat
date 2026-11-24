@@ -13,6 +13,7 @@ const stageNames = ["asr", "llm", "tts"];
 const charSelect = element("char-select");
 const ttsEngineSelect = element("tts-engine-select");
 const voiceSelect = element("voice-select");
+const convLangSelect = element("conv-lang-select");
 const historyList = element("history-list");
 const newConversationButton = element("new-conversation");
 const langToggle = element("lang-toggle");
@@ -54,6 +55,28 @@ let voicesData = {
     { id: "longwan_v2", name: "龙婉 (细腻柔声)" }
   ]
 };
+
+function getConvLanguage() {
+  return convLangSelect ? convLangSelect.value : "auto";
+}
+
+if (convLangSelect) {
+  let savedConvLang = null;
+  try {
+    savedConvLang = localStorage.getItem("openvoicechat.conv_language");
+  } catch {}
+  if (savedConvLang && ["auto", "zh", "en"].includes(savedConvLang)) {
+    convLangSelect.value = savedConvLang;
+  }
+  convLangSelect.addEventListener("change", () => {
+    try {
+      localStorage.setItem("openvoicechat.conv_language", convLangSelect.value);
+    } catch {}
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ action: "set_language", language: convLangSelect.value }));
+    }
+  });
+}
 
 function getCharacterName(c) {
   if (!c) return t("assistant_default_name");
@@ -931,15 +954,20 @@ function onEvent(event) {
     case "devices": showDevices(event); break;
     case "devices_error":
       loadingDevices = false;
-      deviceError = event.message;
+      let devMsg = (event.message_key || event.error_key) ? t(event.message_key || event.error_key, event) : "";
+      if (!devMsg || devMsg === event.message_key || devMsg === event.error_key) {
+        devMsg = (window.ovcI18n?.locale === "en" && event.message_en) ? event.message_en : (event.message || "");
+      }
+      deviceError = devMsg;
       updateControls();
       break;
     case "notice":
-      notice(t(event.message_key, { name: event.name }));
+      notice(t(event.message_key, { name: names.assistant, ...event }));
       break;
     case "error": {
-      let msg = event.message_key ? t(event.message_key, event) : "";
-      if (!msg || msg === event.message_key) {
+      const errKey = event.message_key || event.error_key;
+      let msg = errKey ? t(errKey, event) : "";
+      if (!msg || msg === errKey) {
         msg = (window.ovcI18n?.locale === "en" && event.message_en) ? event.message_en : (event.message || "");
       }
       notice(msg);
@@ -984,6 +1012,12 @@ function onEvent(event) {
       }
       if (event.voice && voiceSelect) {
         voiceSelect.value = event.voice;
+      }
+      if (event.language && convLangSelect) {
+        convLangSelect.value = event.language;
+        try {
+          localStorage.setItem("openvoicechat.conv_language", event.language);
+        } catch {}
       }
       updateControls();
       updateMicStatus();
@@ -1039,7 +1073,8 @@ function onEvent(event) {
 }
 
 function connect() {
-  socket = new WebSocket(`ws://${wsHost}/session`);
+  const langParam = encodeURIComponent(getConvLanguage());
+  socket = new WebSocket(`ws://${wsHost}/session?language=${langParam}`);
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
     socket.send(JSON.stringify({ action: "init" }));
@@ -1086,6 +1121,7 @@ button.addEventListener("click", async () => {
         voice: voiceSelect ? voiceSelect.value : "chinatsu",
         tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
         conversation_id: selectedConversationId,
+        language: getConvLanguage(),
       }));
     } catch (err) {
       console.error("Failed to start audio recording", err);
@@ -1130,7 +1166,7 @@ async function submitTextMessage() {
 
   textInput.value = "";
   if (state === "running") {
-    socket.send(JSON.stringify({ action: "text", text }));
+    socket.send(JSON.stringify({ action: "text", text, language: getConvLanguage() }));
     phase(t("phase_llm_generating", { name: names.assistant }), "llm");
   } else if (state === "idle") {
     setState("starting");
@@ -1154,6 +1190,7 @@ async function submitTextMessage() {
       voice: voiceSelect ? voiceSelect.value : "chinatsu",
       tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
       conversation_id: selectedConversationId,
+      language: getConvLanguage(),
     }));
   }
 }
@@ -1177,6 +1214,7 @@ async function retrySpeakText(text) {
     voice: voiceSelect ? voiceSelect.value : "chinatsu",
     tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
     conversation_id: selectedConversationId,
+    language: getConvLanguage(),
   };
 
   if (state === "running") {
@@ -1232,6 +1270,10 @@ window.addEventListener("ovc:locale-changed", () => {
   updateVoiceOptions();
   if (voiceSelect && prevVoice) {
     voiceSelect.value = prevVoice;
+  }
+  const prevLang = convLangSelect ? convLangSelect.value : "";
+  if (convLangSelect && prevLang) {
+    convLangSelect.value = prevLang;
   }
   updateControls();
   updateMicStatus();
