@@ -174,3 +174,41 @@ def update_conversation_summary(conversation_id: str, summary: str) -> None:
             "UPDATE conversations SET summary = ?, updated_at = ? WHERE id = ?",
             (summary, timestamp, conversation_id),
         )
+
+
+def delete_conversation(conversation_id: str) -> bool:
+    with closing(_connect()) as connection, connection:
+        connection.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        cursor = connection.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        return cursor.rowcount > 0
+
+
+def export_conversation_markdown(conversation: dict) -> str:
+    title = conversation.get("title") or "新对话"
+    char_name = conversation.get("character_name") or "千夏"
+    char_id = conversation.get("character_id") or "mio"
+    created_at = conversation.get("created_at") or ""
+    updated_at = conversation.get("updated_at") or ""
+    lines = [
+        f"# {title}",
+        "",
+        f"- **角色**: {char_name} ({char_id})",
+        f"- **创建时间**: {created_at}",
+        f"- **更新时间**: {updated_at}",
+    ]
+    if conversation.get("voice"):
+        lines.append(f"- **音色**: {conversation['voice']}")
+    if conversation.get("tts_engine"):
+        lines.append(f"- **语音引擎**: {conversation['tts_engine']}")
+    if conversation.get("summary"):
+        lines.extend(["", "### 摘要", "", conversation["summary"]])
+    lines.extend(["", "---", ""])
+    for msg in conversation.get("messages", []):
+        role_label = "用户" if msg.get("role") == "user" else char_name
+        timestamp = msg.get("created_at") or ""
+        time_str = f" ({timestamp})" if timestamp else ""
+        lines.append(f"### {role_label}{time_str}")
+        lines.append("")
+        lines.append(msg.get("content") or "")
+        lines.append("")
+    return "\n".join(lines)

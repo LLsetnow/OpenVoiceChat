@@ -95,7 +95,13 @@
       <aside class="panel history-panel" aria-labelledby="history-title">
         <header class="panel-header history-header">
           <h2 id="history-title" data-i18n="history_title">历史对话</h2>
-          <button class="new-chat" id="new-conversation" type="button" data-i18n="new_chat">新建</button>
+          <div class="history-actions">
+            <label class="ephemeral-label" id="ephemeral-label" data-i18n-title="ephemeral_toggle_title" title="临时对话模式：本次不保存到历史记录">
+              <input type="checkbox" id="ephemeral-toggle">
+              <span data-i18n="ephemeral_mode">临时对话</span>
+            </label>
+            <button class="new-chat" id="new-conversation" type="button" data-i18n="new_chat">新建</button>
+          </div>
         </header>
         <div class="history-list" id="history-list" data-i18n-aria-label="history_title" aria-label="历史对话">
           <p class="history-empty" data-i18n="loading_history">正在加载记录…</p>
@@ -103,9 +109,22 @@
       </aside>
 
       <section class="panel dialogue" aria-labelledby="dialogue-title">
-        <header class="panel-header">
-          <h2 id="dialogue-title" data-i18n="dialogue_title">对话记录</h2>
-          <span id="turn-state" class="turn-state" role="status"></span>
+        <header class="panel-header dialogue-header">
+          <div class="dialogue-header-left">
+            <h2 id="dialogue-title" data-i18n="dialogue_title">对话记录</h2>
+            <span id="ephemeral-badge" class="ephemeral-badge" hidden data-i18n="ephemeral_badge">临时对话（不保存）</span>
+          </div>
+          <div class="dialogue-header-actions">
+            <div class="export-dropdown" id="export-dropdown">
+              <button class="action-btn" id="export-btn" type="button" data-i18n="export_chat" data-i18n-title="export_chat_title" title="导出会话记录">导出</button>
+              <div class="export-menu" id="export-menu" hidden>
+                <button type="button" id="export-json-btn" class="export-menu-item" data-i18n="export_json">导出 JSON</button>
+                <button type="button" id="export-md-btn" class="export-menu-item" data-i18n="export_markdown">导出 Markdown</button>
+              </div>
+            </div>
+            <button class="action-btn action-danger" id="delete-btn" type="button" data-i18n="delete_chat" data-i18n-title="delete_chat_title" title="删除当前对话" disabled>删除</button>
+            <span id="turn-state" class="turn-state" role="status"></span>
+          </div>
         </header>
         <div class="scroll" id="scroll" tabindex="0" data-i18n-aria-label="dialogue_subtitles_label" aria-label="对话字幕">
           <div class="empty" id="empty">

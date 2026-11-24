@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import os
 import re
 import time
 from collections import deque
@@ -100,6 +101,7 @@ class Conversation:
         vad=None,
         verbose: bool = False,
         speaker_mode: bool = False,
+        log_full_text: bool | None = None,
     ):
         self.speech = speech
         self.config = config or Config()
@@ -110,6 +112,15 @@ class Conversation:
         self.on_event = on_event
         self.verbose = verbose
         self.speaker_mode = speaker_mode
+        if log_full_text is None:
+            self.log_full_text = os.environ.get("OVC_LOG_FULL_TEXT", "").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        else:
+            self.log_full_text = bool(log_full_text)
         self.input_paused = False
         self._owns_client = client is None
         if client is None:
@@ -374,6 +385,10 @@ class Conversation:
         sentences: asyncio.Queue[str | None] = asyncio.Queue(maxsize=16)
         tts_task = asyncio.create_task(self._speak(sentences, spoken, 0.0))
         tts_error: Exception | None = None
+        if self.log_full_text:
+            self._log(f"retry_speak start | text={text!r}")
+        else:
+            self._log(f"retry_speak start | chars={len(text)}")
         try:
             parts = _split_sentences(text)
             for part in parts:
@@ -424,7 +439,10 @@ class Conversation:
         completed = False
         started = time.monotonic()
         if text is not None:
-            self._log(f"turn start | text={text!r}")
+            if self.log_full_text:
+                self._log(f"turn start | text={text!r}")
+            else:
+                self._log(f"turn start | chars={len(text)} tokens={estimate_tokens(text)}")
         else:
             self._log(f"turn start | pcm={len(pcm) / 2 / self.config.sample_rate * 1000:.0f}ms")
         try:
@@ -433,7 +451,10 @@ class Conversation:
                 text = await asr_task if asr_task is not None else await self.speech.transcribe(pcm)
                 text = text.strip()
                 asr_ms = round(1000 * (time.monotonic() - stt_started))
-                self._log(f"STT ({asr_ms}ms): {text!r}")
+                if self.log_full_text:
+                    self._log(f"STT ({asr_ms}ms): {text!r}")
+                else:
+                    self._log(f"STT ({asr_ms}ms) | chars={len(text)} tokens={estimate_tokens(text)}")
                 self._event("timing", stage="asr", milliseconds=asr_ms)
             else:
                 text = text.strip()
@@ -501,11 +522,19 @@ class Conversation:
             if buffer.strip():
                 await self._feed(sentences, buffer.strip(), tts_task)
             await self._feed(sentences, None, tts_task)
+            llm_ms = round(1000 * (time.monotonic() - llm_started))
             if response.strip():
+                if self.log_full_text:
+                    self._log(f"LLM done ({llm_ms}ms): {response!r}")
+                else:
+                    self._log(
+                        f"LLM done ({llm_ms}ms) | chars={len(response)} tokens={estimate_tokens(response)}"
+                    )
                 self.messages.append({"role": "assistant", "content": response})
                 self._emit("assistant", response)
                 completed = True
             else:
+                self._log(f"LLM done ({llm_ms}ms) | empty response")
                 self._event("empty_reply")
 
             tts_error: Exception | None = None
@@ -585,7 +614,10 @@ class Conversation:
             if first_segment:
                 self._event("timing", stage="tts", milliseconds=tts_ms)
                 first_segment = False
-            self._log(f"TTS ({tts_ms}ms, {len(audio)} bytes): {sentence!r}")
+            if self.log_full_text:
+                self._log(f"TTS ({tts_ms}ms, {len(audio)} bytes): {sentence!r}")
+            else:
+                self._log(f"TTS ({tts_ms}ms, {len(audio)} bytes) | chars={len(sentence)}")
             if not audio:
                 continue
             if self.speaker_mode and not self.input_paused:
