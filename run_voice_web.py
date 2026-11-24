@@ -6,6 +6,8 @@ import contextlib
 import json
 import logging
 import sqlite3
+import struct
+import uuid
 from pathlib import Path
 
 import uvicorn
@@ -35,7 +37,10 @@ WEB_DIR = Path(__file__).parent / "web"
 PORT = 18768
 log = logging.getLogger(__name__)
 audio_in_use = asyncio.Lock()
+session_lock = asyncio.Lock()
+active_session_id: str | None = None
 active_session_stop = None
+connected_sessions: dict[str, dict] = {}
 
 def run_startup_migrations(target_app: FastAPI) -> dict:
     try:
@@ -217,6 +222,7 @@ async def session(websocket: WebSocket):
         await websocket.close(code=1008)
         return
     await websocket.accept()
+    session_id = uuid.uuid4().hex[:8]
     send_lock = asyncio.Lock()
     events: asyncio.Queue[dict] = asyncio.Queue()
     voice_task: asyncio.Task | None = None
@@ -244,41 +250,56 @@ async def session(websocket: WebSocket):
             while True:
                 pcm = await conv.output.get()
                 if pcm is None:
-                    publish("output_complete")
+                    publish("output_complete", turn_id=conv.current_turn_id)
                     continue
-                await safe_send_bytes(pcm)
+                header = struct.pack(">I", conv.current_turn_id)
+                await safe_send_bytes(header + pcm)
         except asyncio.CancelledError:
             pass
 
     async def stop_voice() -> None:
-        global active_session_stop
-        if active_session_stop is stop_voice:
-            active_session_stop = None
+        global active_session_id, active_session_stop
+        async with session_lock:
+            if active_session_id == session_id:
+                active_session_id = None
+                active_session_stop = None
+                for s_id, s_info in list(connected_sessions.items()):
+                    if s_id != session_id:
+                        s_info["publish"]("session_status", occupied=False)
         nonlocal voice_task, output_task, conversation, input_buffer
         input_buffer.clear()
+        running_loop = asyncio.get_running_loop()
         if output_task is not None:
             output_task.cancel()
-            await asyncio.gather(output_task, return_exceptions=True)
+            if output_task.get_loop() is running_loop:
+                await asyncio.gather(output_task, return_exceptions=True)
             output_task = None
         if conversation is not None:
             conversation.stop()
             with contextlib.suppress(Exception):
-                await conversation.input.put(None)
+                if getattr(conversation.input, "_loop", running_loop) is running_loop:
+                    await conversation.input.put(None)
+                else:
+                    conversation.input.put_nowait(None)
         if voice_task is not None:
             voice_task.cancel()
-            await asyncio.gather(voice_task, return_exceptions=True)
+            if voice_task.get_loop() is running_loop:
+                await asyncio.gather(voice_task, return_exceptions=True)
             voice_task = None
         conversation = None
 
-    def on_turn(conversation_id: str, role: str, text: str) -> None:
+    def on_turn(
+        conversation_id: str, role: str, text: str, turn_id: int | None = None
+    ) -> None:
+        current_tid = turn_id or (conversation.current_turn_id if conversation else None)
         if role == "error":
-            publish("error", message="本轮对话失败，请再说一次。")
+            publish("error", message="本轮对话失败，请再说一次。", turn_id=current_tid)
         else:
             try:
                 append_message(conversation_id, role, text)
             except (DatabaseMigrationError, OSError, RuntimeError) as exc:
                 log.error("Failed to append message to conversation: %s", exc)
-            publish("message", role=role, text=text)
+            publish("message", role=role, text=text, turn_id=current_tid)
 
     async def start_voice(
         barge_in: bool,
@@ -288,22 +309,52 @@ async def session(websocket: WebSocket):
         conversation_id: str | None = None,
         initial_text: str | None = None,
         initial_speak_text: str | None = None,
+        takeover: bool = False,
     ) -> None:
-        global active_session_stop
+        global active_session_id, active_session_stop
         nonlocal voice_task, output_task, conversation
+        prior_stop = None
+        async with session_lock:
+            if active_session_id is not None and active_session_id != session_id:
+                if not takeover:
+                    publish(
+                        "occupied",
+                        session_id=active_session_id,
+                        code="SESSION_OCCUPIED",
+                        message_key="session_occupied",
+                        message="语音会话正在其他标签页运行。",
+                        message_en="Voice session is currently active in another tab.",
+                    )
+                    publish("state", state="idle")
+                    return
+                log.info("Session %s taking over active session %s", session_id, active_session_id)
+                if active_session_id in connected_sessions:
+                    connected_sessions[active_session_id]["publish"](
+                        "taken_over",
+                        code="SESSION_TAKEN_OVER",
+                        message_key="session_taken_over",
+                        message="语音会话已被其他标签页接管。",
+                        message_en="Voice session has been taken over by another tab.",
+                    )
+                prior_stop = active_session_stop
+            active_session_id = session_id
+            active_session_stop = stop_voice
+
+        if prior_stop is not None:
+            await prior_stop()
+            for _ in range(25):
+                if not audio_in_use.locked():
+                    break
+                await asyncio.sleep(0.04)
+
         if audio_in_use.locked():
-            if active_session_stop is not None and active_session_stop is not stop_voice:
-                log.info("Stopping prior active voice session...")
-                await active_session_stop()
-                for _ in range(25):
-                    if not audio_in_use.locked():
-                        break
-                    await asyncio.sleep(0.04)
-            if audio_in_use.locked():
-                publish("error", message="对话正在另一个页面使用，请先在那里停止。")
-                publish("state", state="idle")
-                return
-        active_session_stop = stop_voice
+            publish("error", message="对话正在另一个页面使用，请先在那里停止。")
+            publish("state", state="idle")
+            return
+
+        for s_id, s_info in list(connected_sessions.items()):
+            if s_id != session_id:
+                s_info["publish"]("session_status", occupied=True)
 
         db_status = ensure_database_ready(websocket.app)
         if db_status.get("status") == "error":
@@ -454,7 +505,11 @@ async def session(websocket: WebSocket):
                     config, speech = voice_profile(
                         voice=chosen_voice,
                         language="zh",
-                        on_partial=lambda text: publish("user_partial", text=text),
+                        on_partial=lambda text: publish(
+                            "user_partial",
+                            text=text,
+                            turn_id=conversation.current_turn_id if conversation else None,
+                        ),
                         tts_steps=websocket.app.state.tts_steps,
                         tts_engine=chosen_engine,
                     )
@@ -465,7 +520,9 @@ async def session(websocket: WebSocket):
                             system_prompt=chosen_prompt,
                             history=saved_conversation.get("messages", []),
                             summary=saved_conversation.get("summary"),
-                            on_turn=lambda role, text: on_turn(session_conversation_id, role, text),
+                            on_turn=lambda role, text, **kwargs: on_turn(
+                                session_conversation_id, role, text, kwargs.get("turn_id")
+                            ),
                             on_summary=lambda text: update_conversation_summary(
                                 session_conversation_id, text
                             ),
@@ -501,6 +558,11 @@ async def session(websocket: WebSocket):
 
         voice_task = asyncio.create_task(run_session())
 
+    connected_sessions[session_id] = {
+        "websocket": websocket,
+        "publish": publish,
+        "stop": stop_voice,
+    }
     sender = asyncio.create_task(send_events())
     publish("state", state="idle")
     db_status = ensure_database_ready(websocket.app)
@@ -543,6 +605,11 @@ async def session(websocket: WebSocket):
                     chars = list_characters()
                     cur_char = get_default_character()
                     publish("characters", characters=chars, current=cur_char.name)
+                    publish(
+                        "session_status",
+                        session_id=session_id,
+                        occupied=(active_session_id is not None and active_session_id != session_id),
+                    )
                 if action == "devices":
                     try:
                         publish("devices", **audio_devices(refresh=not audio_in_use.locked()))
@@ -553,6 +620,7 @@ async def session(websocket: WebSocket):
                     cur_char = get_default_character()
                     publish("characters", characters=chars, current=cur_char.name)
                 elif action == "start" and (voice_task is None or voice_task.done()):
+                    takeover = bool(command.get("takeover", False))
                     mode = command.get("mode")
                     if mode == "speaker":
                         barge_in = False
@@ -578,6 +646,32 @@ async def session(websocket: WebSocket):
                         engine_override=e_override,
                         conversation_id=selected_conversation,
                         initial_text=initial_text,
+                        takeover=takeover,
+                    )
+                elif action == "takeover":
+                    mode = command.get("mode")
+                    if mode == "speaker":
+                        barge_in = False
+                    elif mode == "barge_in":
+                        barge_in = True
+                    else:
+                        barge_in = command.get("barge_in", False)
+                    char_id = command.get("character")
+                    v_override = command.get("voice")
+                    e_override = command.get("tts_engine")
+                    selected_conversation = command.get("conversation_id")
+                    if not isinstance(selected_conversation, str):
+                        selected_conversation = None
+                    initial_text = command.get("text")
+                    initial_text = initial_text.strip() if isinstance(initial_text, str) and initial_text.strip() else None
+                    await start_voice(
+                        barge_in,
+                        character_id=char_id,
+                        voice_override=v_override,
+                        engine_override=e_override,
+                        conversation_id=selected_conversation,
+                        initial_text=initial_text,
+                        takeover=True,
                     )
                 elif action == "text":
                     text_content = command.get("text")
@@ -632,17 +726,29 @@ async def session(websocket: WebSocket):
                             initial_speak_text=text_content,
                         )
                 elif action == "playback_started":
+                    msg_turn_id = command.get("turn_id")
                     if conversation is not None:
-                        conversation.agent_speaking = True
+                        if msg_turn_id is None or msg_turn_id == conversation.current_turn_id:
+                            conversation.agent_speaking = True
+                        else:
+                            log.debug("Discarding stale playback_started for turn %s (current: %s)", msg_turn_id, conversation.current_turn_id)
                 elif action == "playback_ended":
+                    msg_turn_id = command.get("turn_id")
                     if conversation is not None:
-                        conversation.notify_playback_ended()
+                        if msg_turn_id is None or msg_turn_id == conversation.current_turn_id:
+                            conversation.notify_playback_ended(turn_id=msg_turn_id)
+                        else:
+                            log.debug("Discarding stale playback_ended for turn %s (current: %s)", msg_turn_id, conversation.current_turn_id)
+                elif action == "interrupt":
+                    if conversation is not None:
+                        await conversation._interrupt()
                 elif action == "stop":
                     await stop_voice()
                     publish("state", state="idle")
     except (WebSocketDisconnect, WebSocketDisconnected):
         pass
     finally:
+        connected_sessions.pop(session_id, None)
         sender.cancel()
         await stop_voice()
         await asyncio.gather(sender, return_exceptions=True)
