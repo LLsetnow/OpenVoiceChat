@@ -10,9 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 DATA_DIR = Path(
-    os.environ.get(
-        "OPENVOICECHAT_DATA_DIR", Path(__file__).resolve().parent.parent / "data"
-    )
+    os.environ.get("OPENVOICECHAT_DATA_DIR", Path(__file__).resolve().parent.parent / "data")
 )
 DATABASE = DATA_DIR / "conversations.sqlite3"
 
@@ -32,21 +30,40 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def create_conversation(character_id: str, character_name: str) -> dict:
+def create_conversation(
+    character_id: str,
+    character_name: str,
+    voice: str | None = None,
+    tts_engine: str | None = None,
+    summary: str | None = None,
+) -> dict:
     conversation_id = uuid.uuid4().hex
     timestamp = _now()
     with closing(_connect()) as connection, connection:
         connection.execute(
             """INSERT INTO conversations
-               (id, title, character_id, character_name, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (conversation_id, "新对话", character_id, character_name, timestamp, timestamp),
+               (id, title, character_id, character_name, voice, tts_engine, summary, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                conversation_id,
+                "新对话",
+                character_id,
+                character_name,
+                voice,
+                tts_engine,
+                summary,
+                timestamp,
+                timestamp,
+            ),
         )
     return {
         "id": conversation_id,
         "title": "新对话",
         "character_id": character_id,
         "character_name": character_name,
+        "voice": voice,
+        "tts_engine": tts_engine,
+        "summary": summary,
         "created_at": timestamp,
         "updated_at": timestamp,
         "messages": [],
@@ -57,6 +74,7 @@ def list_conversations() -> list[dict]:
     with closing(_connect()) as connection, connection:
         rows = connection.execute(
             """SELECT c.id, c.title, c.character_id, c.character_name,
+                      c.voice, c.tts_engine, c.summary,
                       c.created_at, c.updated_at, COUNT(m.id) AS message_count,
                       (SELECT content FROM messages WHERE conversation_id = c.id
                        ORDER BY id DESC LIMIT 1) AS preview
@@ -72,7 +90,8 @@ def list_conversations() -> list[dict]:
 def get_conversation(conversation_id: str) -> dict | None:
     with closing(_connect()) as connection, connection:
         row = connection.execute(
-            """SELECT id, title, character_id, character_name, created_at, updated_at
+            """SELECT id, title, character_id, character_name,
+                      voice, tts_engine, summary, created_at, updated_at
                FROM conversations WHERE id = ?""",
             (conversation_id,),
         ).fetchone()
@@ -111,4 +130,47 @@ def append_message(conversation_id: str, role: str, content: str) -> None:
         connection.execute(
             "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
             (title, timestamp, conversation_id),
+        )
+
+
+def update_conversation_settings(
+    conversation_id: str,
+    character_id: str | None = None,
+    character_name: str | None = None,
+    voice: str | None = None,
+    tts_engine: str | None = None,
+) -> None:
+    timestamp = _now()
+    fields = []
+    values = []
+    if character_id is not None:
+        fields.append("character_id = ?")
+        values.append(character_id)
+    if character_name is not None:
+        fields.append("character_name = ?")
+        values.append(character_name)
+    if voice is not None:
+        fields.append("voice = ?")
+        values.append(voice)
+    if tts_engine is not None:
+        fields.append("tts_engine = ?")
+        values.append(tts_engine)
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    values.append(timestamp)
+    values.append(conversation_id)
+    with closing(_connect()) as connection, connection:
+        connection.execute(
+            f"UPDATE conversations SET {', '.join(fields)} WHERE id = ?",
+            values,
+        )
+
+
+def update_conversation_summary(conversation_id: str, summary: str) -> None:
+    timestamp = _now()
+    with closing(_connect()) as connection, connection:
+        connection.execute(
+            "UPDATE conversations SET summary = ?, updated_at = ? WHERE id = ?",
+            (summary, timestamp, conversation_id),
         )

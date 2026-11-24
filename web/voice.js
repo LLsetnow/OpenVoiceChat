@@ -96,7 +96,14 @@ async function fetchVoicesAndCharacters() {
 
   await refreshConversationList();
   if (conversationData.length) {
-    await openConversation(conversationData[0].id);
+    let targetId = conversationData[0].id;
+    try {
+      const savedId = localStorage.getItem("openvoicechat.selected_conversation");
+      if (savedId && conversationData.some(item => item.id === savedId)) {
+        targetId = savedId;
+      }
+    } catch {}
+    await openConversation(targetId);
   }
 }
 
@@ -336,11 +343,27 @@ async function openConversation(id) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const conversation = await response.json();
     selectedConversationId = conversation.id;
+    try {
+      localStorage.setItem("openvoicechat.selected_conversation", conversation.id);
+    } catch {}
     renderConversationMessages(conversation.messages || []);
-    const character = charactersData.find(item => item.id === conversation.character_id);
+    let character = charactersData.find(item => item.id === conversation.character_id);
+    if (!character && charactersData.length > 0) {
+      character = charactersData[0];
+      notice(t("char_deleted_fallback", { name: getCharacterName(character) }));
+    }
     if (character) {
       charSelect.value = character.id;
       applyCharacter(character);
+    }
+    if (conversation.tts_engine) {
+      ttsEngineSelect.value = conversation.tts_engine;
+      updateVoiceOptions();
+    } else {
+      notice(t("legacy_settings_fallback"));
+    }
+    if (conversation.voice) {
+      voiceSelect.value = conversation.voice;
     }
     await refreshConversationList();
   } catch (err) {
@@ -352,6 +375,9 @@ async function openConversation(id) {
 function startNewConversation() {
   if (state !== "idle") return;
   selectedConversationId = null;
+  try {
+    localStorage.removeItem("openvoicechat.selected_conversation");
+  } catch {}
   renderConversationMessages([]);
   if (charactersData.length) {
     charSelect.value = charactersData[0].id;
@@ -862,6 +888,9 @@ function onEvent(event) {
       deviceError = event.message;
       updateControls();
       break;
+    case "notice":
+      notice(t(event.message_key, { name: event.name }));
+      break;
     case "error": notice(event.message || (event.message_key ? t(event.message_key) : "")); finishDrafts(); phase(""); break;
     case "speech_start":
       serverGenerating = false;
@@ -883,6 +912,15 @@ function onEvent(event) {
         if (charNameDisplay) charNameDisplay.textContent = names.assistant;
       }
       if (event.avatar) setAvatar(event.avatar);
+      if (event.tts_engine && ttsEngineSelect) {
+        ttsEngineSelect.value = event.tts_engine;
+        updateVoiceOptions();
+      }
+      if (event.voice && voiceSelect) {
+        voiceSelect.value = event.voice;
+      }
+      updateControls();
+      updateMicStatus();
       break;
     case "characters":
       if (event.characters && event.characters.length) {

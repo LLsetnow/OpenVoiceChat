@@ -24,6 +24,8 @@ from openvoicechat.history import (
     create_conversation,
     get_conversation,
     list_conversations,
+    update_conversation_settings,
+    update_conversation_summary,
 )
 from run_voice_chat import DEFAULT_PROMPT, VoiceConfigurationError, voice_profile
 
@@ -48,7 +50,9 @@ app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
 
 @app.get("/")
 async def index():
-    return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+    return FileResponse(
+        WEB_DIR / "index.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+    )
 
 
 @app.get("/api/characters")
@@ -73,6 +77,7 @@ async def api_conversation(conversation_id: str):
 async def api_voices():
     # Return available voices for different TTS engines
     import httpx
+
     gpt_sovits_voices = []
     try:
         async with httpx.AsyncClient(timeout=2) as client:
@@ -97,7 +102,7 @@ async def api_voices():
             {"id": "longhua_v2", "name": "龙华 (元气甜美)"},
             {"id": "longfeifei_v2", "name": "龙菲菲 (甜美娇气)"},
             {"id": "longwan_v2", "name": "龙婉 (细腻柔声)"},
-        ]
+        ],
     }
 
 
@@ -105,7 +110,9 @@ async def api_voices():
 async def session(websocket: WebSocket):
     origin = websocket.headers.get("origin") or ""
     host = websocket.headers.get("host") or ""
-    allowed = origin == f"http://{host}" or origin.startswith(("http://127.0.0.1:", "http://localhost:"))
+    allowed = origin == f"http://{host}" or origin.startswith(
+        ("http://127.0.0.1:", "http://localhost:")
+    )
     if not allowed:
         await websocket.close(code=1008)
         return
@@ -176,7 +183,7 @@ async def session(websocket: WebSocket):
         voice_override: str | None = None,
         engine_override: str | None = None,
         conversation_id: str | None = None,
-       initial_text: str | None = None,
+        initial_text: str | None = None,
     ) -> None:
         global active_session_stop
         nonlocal voice_task, output_task, conversation
@@ -194,33 +201,112 @@ async def session(websocket: WebSocket):
                 return
         active_session_stop = stop_voice
 
-        char = None
-        if character_id:
-            try:
-                char = CharacterConfig.from_file(character_id)
-            except (OSError, ValueError, TypeError, AttributeError) as exc:
-                log.warning("Failed to load character %s: %s", character_id, exc)
-        if char is None:
-            char = get_default_character()
-
         saved_conversation = get_conversation(conversation_id) if conversation_id else None
         if conversation_id and saved_conversation is None:
             publish("error", message_key="history_missing")
             publish("state", state="idle")
             return
-        if saved_conversation is None:
-            saved_conversation = create_conversation(character_id or "mio", char.name)
-        elif not character_id:
-            character_id = saved_conversation["character_id"]
+
+        if saved_conversation is not None:
+            hist_char_id = saved_conversation.get("character_id")
+            hist_voice = saved_conversation.get("voice")
+            hist_engine = saved_conversation.get("tts_engine")
+
+            # Check if user explicitly changed character
+            if character_id is not None and character_id != hist_char_id:
+                chosen_char_id = character_id
+                char_changed = True
+            else:
+                chosen_char_id = hist_char_id
+                char_changed = False
+
+            char = None
+            if chosen_char_id:
+                try:
+                    char = CharacterConfig.from_file(chosen_char_id)
+                except (OSError, ValueError, TypeError, AttributeError, FileNotFoundError) as exc:
+                    log.warning("Failed to load character %s: %s", chosen_char_id, exc)
+
+            if char is None:
+                char = get_default_character()
+                publish("notice", message_key="char_deleted_fallback", name=char.name)
+                chosen_char_id = char.name.lower() or "mio"
+                char_changed = True
+
+            # Check engine
+            if (
+                engine_override is not None
+                and hist_engine is not None
+                and engine_override != hist_engine
+            ):
+                chosen_engine = engine_override
+                engine_changed = True
+            elif hist_engine:
+                chosen_engine = hist_engine
+                engine_changed = False
+            else:
+                chosen_engine = engine_override or char.tts_engine or "gpt_sovits"
+                publish("notice", message_key="legacy_settings_fallback")
+                engine_changed = True
+
+            # Check voice
+            if (
+                voice_override is not None
+                and hist_voice is not None
+                and voice_override != hist_voice
+            ):
+                chosen_voice = voice_override
+                voice_changed = True
+            elif hist_voice:
+                chosen_voice = hist_voice
+                voice_changed = False
+            else:
+                chosen_voice = voice_override or char.voice or TTS_VOICE
+                if not engine_changed:
+                    publish("notice", message_key="legacy_settings_fallback")
+                voice_changed = True
+
+            if char_changed or engine_changed or voice_changed:
+                update_conversation_settings(
+                    saved_conversation["id"],
+                    character_id=chosen_char_id,
+                    character_name=char.name,
+                    voice=chosen_voice,
+                    tts_engine=chosen_engine,
+                )
+        else:
+            char = None
+            if character_id:
+                try:
+                    char = CharacterConfig.from_file(character_id)
+                except (OSError, ValueError, TypeError, AttributeError, FileNotFoundError) as exc:
+                    log.warning("Failed to load character %s: %s", character_id, exc)
+            if char is None:
+                char = get_default_character()
+
+            chosen_voice = voice_override or char.voice or TTS_VOICE
+            chosen_engine = engine_override or char.tts_engine or "gpt_sovits"
+            chosen_char_id = character_id or "mio"
+            saved_conversation = create_conversation(
+                chosen_char_id,
+                char.name,
+                voice=chosen_voice,
+                tts_engine=chosen_engine,
+            )
+
         session_conversation_id = saved_conversation["id"]
         publish("conversation", id=session_conversation_id)
 
-        chosen_voice = voice_override or char.voice or TTS_VOICE
-        chosen_engine = engine_override or char.tts_engine or "gpt_sovits"
         chosen_prompt = char.system_prompt or DEFAULT_PROMPT
         chosen_name = char.name or "Mio"
 
-        publish("character_info", name=chosen_name, avatar=char.avatar, voice=chosen_voice, tts_engine=chosen_engine)
+        publish(
+            "character_info",
+            name=chosen_name,
+            avatar=char.avatar,
+            voice=chosen_voice,
+            tts_engine=chosen_engine,
+        )
 
         async def run_session():
             nonlocal conversation, output_task
@@ -239,8 +325,12 @@ async def session(websocket: WebSocket):
                             speech,
                             config=config,
                             system_prompt=chosen_prompt,
-                            history=saved_conversation["messages"],
+                            history=saved_conversation.get("messages", []),
+                            summary=saved_conversation.get("summary"),
                             on_turn=lambda role, text: on_turn(session_conversation_id, role, text),
+                            on_summary=lambda text: update_conversation_summary(
+                                session_conversation_id, text
+                            ),
                             on_event=publish,
                             verbose=True,
                             speaker_mode=not barge_in,
@@ -340,7 +430,11 @@ async def session(websocket: WebSocket):
                             await conversation.send_text(text_content)
                         elif voice_task is None or voice_task.done():
                             mode = command.get("mode")
-                            barge_in = mode == "barge_in" if mode in ("speaker", "barge_in") else command.get("barge_in", False)
+                            barge_in = (
+                                mode == "barge_in"
+                                if mode in ("speaker", "barge_in")
+                                else command.get("barge_in", False)
+                            )
                             char_id = command.get("character")
                             v_override = command.get("voice")
                             e_override = command.get("tts_engine")
@@ -377,7 +471,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=PORT, help="port on 127.0.0.1")
     parser.add_argument(
-        "--tts-steps", type=int, choices=(4, 8), default=TTS_SAMPLE_STEPS,
+        "--tts-steps",
+        type=int,
+        choices=(4, 8),
+        default=TTS_SAMPLE_STEPS,
         help="GPT-SoVITS v4 sampling steps",
     )
     args = parser.parse_args()
