@@ -95,37 +95,69 @@ On Linux you may need PortAudio: `sudo apt install libportaudio2`.
 resampled between the device rate and 16 kHz internally. **Use headphones** —
 there is no echo cancellation, and speaker output will feed back into the VAD.
 
-## Mac 语音对话：DeepSeek、阿里云与 GPT-SoVITS
+## 两种运行模式 (Runtime Modes)
 
-这个入口使用 Mac 的麦克风和扬声器。Silero VAD 在本机检测说话，阿里云
-`paraformer-realtime-v2` 在说话期间通过 WebSocket 接收音频。停顿后，识别结果交给
-DeepSeek V4.1 Flash（`deepseek-flash`，关闭思考模式）。生成的回复按句送到
-AiServer 的 GPT-SoVITS v4 接口，默认用千夏（`chinatsu`）。建议戴耳机，避免喇叭声音触发麦克风。
+OpenVoiceChat 支持两种清晰区分的运行模式：
+
+1. **本地模型模式 (Local Mode)**：全本地离线运行，使用 Parakeet TDT 语音识别 + Kokoro-82M 语音合成 + Silero VAD + 本地/自建 OpenAI 兼容 LLM（如 Ollama、llama.cpp、vLLM）。适合具备 GPU 的工作站或完全离线场景。
+2. **Mac 网页 / 云端模式 (Mac Web & Cloud Mode)**：云端高精度流式语音识别 + 云端/局域网大模型语音对话，通过现代 Web 界面与 WebSocket 交互，具备会话记录持久化、历史继续对话、文本混合输入与完整中英文双语支持。
+
+---
+
+### 1. 本地模型模式 (Local Mode)
+
+请参见上方 [Architecture](#architecture) 与 [Quickstart](#quickstart)：
+- **STT:** 本地 NVIDIA Parakeet TDT 0.6B v3 (`onnx-asr`)
+- **TTS:** 本地 Kokoro-82M
+- **VAD:** 本地 Silero VAD v5
+- **LLM:** 本地或自托管的 OpenAI 兼容端点（如 `http://localhost:11434/v1`，模型 `qwen3:4b`）
+
+运行诊断：
+```bash
+ovc doctor
+ovc doctor --json
+```
+
+---
+
+### 2. Mac 网页 / 云端模式 (Mac Web & Cloud Mode)
+
+此模式使用云端与局域网服务协同工作，支持 Mac 终端麦克风交互及完整 Web 交互：
+- **语音识别 (ASR)**：云端 DashScope Qwen 流式语音识别（默认模型 `qwen-audio-3.1-asr-flash-streaming`，基于阿里云 DashScope WebSocket API），毫秒级首字与流式返回。
+- **大语言模型 (LLM)**：DeepSeek V4.1 Flash（默认 `deepseek-flash`，关闭思考模式，流式生成）。
+- **语音合成 (TTS)**：
+  * **GPT-SoVITS v4**：局域网 AiServer 本地推理服务，统一配置地址 `SOVITS_URL`（默认 `http://127.0.0.1:19889`），默认音色为千夏（`chinatsu`）。
+  * **DashScope CosyVoice**：阿里云云端大模型 TTS，支持龙小淳（`longxiaochun_v2`）等云端音色。
+- **会话持久化**：本地 SQLite 数据库存储（`data/conversations.sqlite3`），首次运行自动执行迁移。
 
 在项目目录安装并启动：
 
 ```bash
 uv venv --python 3.12
-uv pip install -e '.[aliyun]'
-.venv/bin/python run_voice_chat.py -v
+uv pip install -e '.[aliyun,web]'
+
+# 运行环境与服务诊断
+ovc doctor --web
 ```
 
-启动终端需有 `DEEPSEEK_API_KEY` 和 `ALIYUN_API_KEY`。也可以填在项目目录的 `.env`
-中，格式见 `.env.example`。阿里云密钥需有北京地域的 Paraformer 访问权限。
-启动前在 AiServer 确认 GPT-SoVITS v4 已运行，Mac 转发地址为 `http://127.0.0.1:19889/`。
-首次启动加载 Silero VAD，macOS 提示时需要允许终端使用麦克风。
+启动终端需配置 `DEEPSEEK_API_KEY` 以及 `ALIYUN_API_KEY`（或 `DASHSCOPE_API_KEY`）。也可以填在项目目录的 `.env` 中，格式见 `.env.example`。
+若使用 GPT-SoVITS，启动前在 AiServer 确认 GPT-SoVITS v4 服务已就绪，Mac 转发地址统一配置为 `SOVITS_URL`（默认 `http://127.0.0.1:19889`）。
 
-可以用 `--voice` 换音色，用 `--tts-language en` 练习纯英文对话，或用 `--prompt`
-指定对话主题。合成语言默认为中文混读模式（`zh`）。按 `Ctrl+C` 结束对话。
-回复首段在自然的短分句处开始合成，后续按整句合成。GPT-SoVITS 默认使用 8 步，
-命令行和网页服务均可用 `--tts-steps 4` 改为 4 步。
+终端麦克风对话入口：
+```bash
+.venv/bin/python run_voice_chat.py -v
+```
+可以用 `--voice` 换音色，用 `--tts-engine cosyvoice` 切换到云端 CosyVoice，用 `--tts-language en` 练习英文，或用 `--sovits-url http://127.0.0.1:19889` 覆盖 GPT-SoVITS 服务地址。
 
-### 本地网页
+#### 本地网页服务
 
 ```bash
-uv pip install -e '.[aliyun,web]'
 .venv/bin/python -m openvoicechat.migrate
 .venv/bin/python run_voice_web.py
+```
+可追加 `--sovits-url` 统一指定 GPT-SoVITS 远程服务地址：
+```bash
+.venv/bin/python run_voice_web.py --sovits-url http://127.0.0.1:19889
 ```
 
 打开 `http://127.0.0.1:18768`，选好麦克风和声音输出后点击「开始对话」。网页使用
@@ -213,6 +245,9 @@ They print once per process. The library does not hide them.
 LLM_API_KEY=...
 AGENT_API_TOKEN=...
 DAILY_API_KEY=...
+DEEPSEEK_API_KEY=...
+ALIYUN_API_KEY=...       # or DASHSCOPE_API_KEY
+SOVITS_URL=http://127.0.0.1:19889
 ```
 
 Everything else is a field on `Config` in `openvoicechat/config.py`:
@@ -223,6 +258,7 @@ from openvoicechat import Config
 config = Config(
     llm_model="gpt-6-luna",
     llm_base_url="",           # empty means https://api.openai.com/v1
+    sovits_url="http://127.0.0.1:19889",
     endpoint_silence_ms=400,
     vad_threshold=0.6,
 )
@@ -252,14 +288,18 @@ stalled model cannot freeze a turn.
 ## Check your machine
 
 ```bash
+# Check local pipeline (GPU/CUDA, ONNX Runtime, Parakeet, Kokoro, Audio, Silero, LLM):
 ovc doctor
 ovc doctor --json
+
+# Check Mac web / cloud pipeline (DashScope ASR, LLM key, GPT-SoVITS availability, Database):
+ovc doctor --mode web
+ovc doctor --web --json
 ```
 
-`doctor` checks Python, `torch`/CUDA, ONNX Runtime providers, Parakeet and Kokoro
-imports, audio devices, the Silero cache, and LLM configuration. It exits `0`
-when ready and `2` when something required is missing. `--json` emits a stable
-schema for agents:
+`doctor` inspects the necessary hardware, dependencies, service endpoints and database storage.
+It exits `0` when ready and `2` when something required is missing or failed.
+`--json` emits a stable schema for agents:
 
 ```json
 {

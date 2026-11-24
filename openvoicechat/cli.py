@@ -102,6 +102,97 @@ def _llm() -> Check:
     return Check("llm", "ok", f"{config.llm_model} @ {base}")
 
 
+def _dashscope() -> Check:
+    import os
+
+    api_key = (os.getenv("DASHSCOPE_API_KEY") or os.getenv("ALIYUN_API_KEY") or "").strip()
+    if not api_key:
+        return Check(
+            "dashscope",
+            "missing",
+            "set DASHSCOPE_API_KEY or ALIYUN_API_KEY in .env or environment",
+        )
+    masked = api_key[:4] + "..." + api_key[-4:] if len(api_key) > 8 else "***"
+    return Check("dashscope", "ok", f"configured ({masked})")
+
+
+def _web_llm() -> Check:
+    import os
+
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    llm_key = os.getenv("LLM_API_KEY", "").strip() or os.getenv("OPENAI_API_KEY", "").strip()
+    if deepseek_key:
+        masked = deepseek_key[:4] + "..." + deepseek_key[-4:] if len(deepseek_key) > 8 else "***"
+        return Check("llm", "ok", f"DeepSeek configured ({masked})")
+    if llm_key:
+        masked = llm_key[:4] + "..." + llm_key[-4:] if len(llm_key) > 8 else "***"
+        return Check("llm", "ok", f"LLM key configured ({masked})")
+    return Check("llm", "missing", "set DEEPSEEK_API_KEY (recommended) or LLM_API_KEY in .env")
+
+
+def _sovits(sovits_url: str | None = None) -> Check:
+    import json
+    import os
+    import urllib.error
+    import urllib.request
+
+    from .config import Config
+
+    target_url = (sovits_url or os.getenv("SOVITS_URL") or Config().sovits_url).rstrip("/")
+    endpoint = f"{target_url}/voices"
+    req = urllib.request.Request(endpoint, headers={"User-Agent": "OpenVoiceChat-Doctor"})
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            if resp.status == 200:
+                body = json.loads(resp.read().decode("utf-8"))
+                voices = body.get("voices", [])
+                count = len(voices) if isinstance(voices, list) else 0
+                return Check("sovits", "ok", f"{target_url} | ready ({count} voice(s) available)")
+            return Check("sovits", "warn", f"{target_url} returned HTTP {resp.status}")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", str(exc))
+        return Check(
+            "sovits",
+            "warn",
+            f"cannot connect to {target_url}/voices: {reason} (start AiServer or switch to CosyVoice)",
+        )
+    except Exception as exc:  # noqa: BLE001 - catch unexpected probe errors
+        return Check("sovits", "warn", f"error probing {target_url}: {exc}")
+
+
+def _database() -> Check:
+    import sqlite3
+
+    from .history import DATA_DIR, DATABASE
+
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return Check("database", "fail", f"cannot create data directory {DATA_DIR}: {exc}")
+
+    test_file = DATA_DIR / ".doctor_write_test"
+    try:
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink(missing_ok=True)
+    except OSError as exc:
+        return Check("database", "fail", f"data directory {DATA_DIR} is not writable: {exc}")
+
+    if not DATABASE.is_file():
+        return Check(
+            "database",
+            "warn",
+            f"{DATABASE} does not exist (created automatically on web start, or run 'python -m openvoicechat.migrate')",
+        )
+
+    try:
+        with sqlite3.connect(DATABASE, timeout=3) as conn:
+            cur = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
+            version = cur.fetchone()[0]
+        return Check("database", "ok", f"{DATABASE} | ready (migration version: {version})")
+    except Exception as exc:  # noqa: BLE001 - sqlite3 operational or query errors
+        return Check("database", "fail", f"cannot query {DATABASE}: {exc}")
+
+
 def collect_checks() -> list[Check]:
     return [
         _python(),
@@ -115,15 +206,29 @@ def collect_checks() -> list[Check]:
     ]
 
 
-def doctor(as_json: bool) -> int:
+def collect_web_checks(sovits_url: str | None = None) -> list[Check]:
+    return [
+        _python(),
+        _dashscope(),
+        _web_llm(),
+        _sovits(sovits_url),
+        _database(),
+    ]
+
+
+def doctor(as_json: bool, mode: str = "local", sovits_url: str | None = None) -> int:
     from dotenv import find_dotenv, load_dotenv
 
     load_dotenv(find_dotenv(usecwd=True))
-    checks = collect_checks()
+    if mode == "web":
+        checks = collect_web_checks(sovits_url=sovits_url)
+    else:
+        checks = collect_checks()
     ok = not any(check.status in ("missing", "fail") for check in checks)
     if as_json:
         payload = {
             "schema_version": SCHEMA_VERSION,
+            "mode": mode,
             "ok": ok,
             "checks": [asdict(check) for check in checks],
         }
@@ -145,6 +250,22 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")
     check = subcommands.add_parser("doctor", help="check hardware, models, and configuration")
     check.add_argument("--json", action="store_true", help="machine-readable output")
+    check.add_argument(
+        "--mode",
+        choices=("local", "web"),
+        default="local",
+        help="diagnosis mode: local (default) or web (Mac/cloud web mode)",
+    )
+    check.add_argument(
+        "--web",
+        action="store_true",
+        help="shorthand for --mode web",
+    )
+    check.add_argument(
+        "--sovits-url",
+        default=None,
+        help="override GPT-SoVITS URL for web mode check",
+    )
     return parser
 
 
@@ -152,7 +273,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "doctor":
-        return doctor(args.json)
+        mode = "web" if args.web else args.mode
+        return doctor(args.json, mode=mode, sovits_url=args.sovits_url)
     parser.print_help()
     return 0
 

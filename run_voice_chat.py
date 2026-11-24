@@ -14,7 +14,7 @@ from openvoicechat.aliyun_sovits import (
 )
 from openvoicechat.audio import run_local
 from openvoicechat.character import CharacterConfig, get_default_character
-from openvoicechat.config import Config
+from openvoicechat.config import DEFAULT_SOVITS_URL, Config
 from openvoicechat.conversation import Conversation
 
 MODEL = "deepseek-flash"
@@ -32,9 +32,10 @@ class VoiceConfigurationError(ValueError):
 
 def voice_profile(
     *, voice: str, language: str, on_partial=None, tts_steps: int = TTS_SAMPLE_STEPS, tts_engine: str = "gpt_sovits",
+    sovits_url: str | None = None,
 ) -> tuple[Config, AliyunSpeechPipeline]:
     deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    aliyun_key = os.getenv("ALIYUN_API_KEY", "").strip()
+    aliyun_key = (os.getenv("ALIYUN_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or "").strip()
     missing = [
         name for name, value in (("DEEPSEEK_API_KEY", deepseek_key), ("ALIYUN_API_KEY", aliyun_key))
         if not value
@@ -44,6 +45,7 @@ def voice_profile(
             f"缺少环境变量：{', '.join(missing)}。请在启动终端中导出，或设在项目的 .env 文件中。"
         )
 
+    config_sovits_url = sovits_url or os.getenv("SOVITS_URL") or DEFAULT_SOVITS_URL
     config = Config(
         llm_api_key=deepseek_key,
         llm_base_url="https://api.deepseek.com",
@@ -51,9 +53,11 @@ def voice_profile(
         llm_extra_body={"thinking": {"type": "disabled"}},
         endpoint_silence_ms=400,
         speak_first_clause=True,
+        sovits_url=config_sovits_url,
     )
     return config, AliyunSpeechPipeline(
         aliyun_key, voice=voice, language=language, on_partial=on_partial, sample_steps=tts_steps, tts_engine=tts_engine,
+        sovits_url=config.sovits_url,
     )
 
 
@@ -81,6 +85,7 @@ async def run(args: argparse.Namespace) -> None:
     try:
         config, speech = voice_profile(
             voice=voice, language=args.tts_language, tts_steps=args.tts_steps, tts_engine=tts_engine,
+            sovits_url=getattr(args, "sovits_url", None),
         )
     except VoiceConfigurationError as exc:
         raise SystemExit(str(exc)) from None
@@ -118,6 +123,10 @@ def main() -> None:
     parser.add_argument(
         "--tts-language", default="zh", choices=("zh", "en", "auto", "all_ja", "all_ko"),
         help="GPT-SoVITS text language (default: zh, supports mixed English)",
+    )
+    parser.add_argument(
+        "--sovits-url", default=None,
+        help="GPT-SoVITS remote service URL (default: http://127.0.0.1:19889 or SOVITS_URL env)",
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="system prompt")
     parser.add_argument("--input-device", type=_device, help="sounddevice input device")

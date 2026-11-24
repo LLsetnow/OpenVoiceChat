@@ -15,6 +15,7 @@ load_dotenv(".env")
 
 DEFAULT_LLM_BASE_URL = ""  # empty means https://api.openai.com/v1
 DEFAULT_LLM_MODEL = "gpt-6-luna"
+DEFAULT_SOVITS_URL = "http://127.0.0.1:19889"
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,11 @@ class Config:
     context_token_budget: int = 2048
     summary_token_budget: int = 512
 
+    # Voice services.
+    sovits_url: str = field(
+        default_factory=lambda: os.getenv("SOVITS_URL") or DEFAULT_SOVITS_URL
+    )
+
     # Runtime and turn taking.
     max_sessions: int = 5
     data_dir: str = "data"
@@ -45,3 +51,7 @@ class Config:
     max_utterance_ms: int = 30000
     llm_extra_body: dict[str, object] | None = None
     speak_first_clause: bool = False
+
+    def __post_init__(self) -> None:
+        if self.sovits_url:
+            object.__setattr__(self, "sovits_url", self.sovits_url.rstrip("/"))

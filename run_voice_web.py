@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import sqlite3
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from starlette.websockets import WebSocketDisconnected
 from openvoicechat.aliyun_sovits import TTS_SAMPLE_STEPS, TTS_VOICE
 from openvoicechat.audio import SPEECH_FRAME_BYTES, audio_devices
 from openvoicechat.character import CharacterConfig, get_default_character, list_characters
+from openvoicechat.config import Config
 from openvoicechat.conversation import Conversation
 from openvoicechat.history import (
     append_message,
@@ -83,6 +85,8 @@ def ensure_database_ready(target_app: FastAPI) -> dict:
 @contextlib.asynccontextmanager
 async def lifespan(target_app: FastAPI):
     run_startup_migrations(target_app)
+    sovits_url = getattr(target_app.state, "sovits_url", None) or Config().sovits_url
+    log.info("GPT-SoVITS service configured at: %s", sovits_url)
     yield
 
 
@@ -90,6 +94,7 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
 app.state.tts_steps = TTS_SAMPLE_STEPS
 app.state.database_status = None
 app.state.migration_error = None
+app.state.sovits_url = None
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 app.add_middleware(
     CORSMiddleware,
@@ -116,9 +121,11 @@ async def api_characters():
 @app.get("/api/status")
 async def api_status():
     status = ensure_database_ready(app)
+    sovits_url = getattr(app.state, "sovits_url", None) or Config().sovits_url
     return {
         "status": "ready" if status.get("status") == "ready" else "degraded",
         "database": status,
+        "sovits_url": sovits_url,
     }
 
 
@@ -178,14 +185,15 @@ async def api_voices():
     # Return available voices for different TTS engines
     import httpx
 
+    sovits_url = (getattr(app.state, "sovits_url", None) or Config().sovits_url).rstrip("/")
     gpt_sovits_voices = []
     try:
         async with httpx.AsyncClient(timeout=2) as client:
-            resp = await client.get("http://127.0.0.1:19889/voices")
+            resp = await client.get(f"{sovits_url}/voices")
             if resp.status_code == 200:
                 gpt_sovits_voices = resp.json().get("voices", [])
     except (httpx.HTTPError, ValueError) as exc:
-        log.debug("Could not load GPT-SoVITS voices: %s", exc)
+        log.debug("Could not load GPT-SoVITS voices from %s: %s", sovits_url, exc)
     if not gpt_sovits_voices:
         gpt_sovits_voices = [
             {"id": "chinatsu", "name": "千夏"},
@@ -451,12 +459,14 @@ async def session(websocket: WebSocket):
             try:
                 async with audio_in_use:
                     publish("state", state="starting")
+                    sovits_url = getattr(websocket.app.state, "sovits_url", None)
                     config, speech = voice_profile(
                         voice=chosen_voice,
                         language="zh",
                         on_partial=lambda text: publish("user_partial", text=text),
                         tts_steps=websocket.app.state.tts_steps,
                         tts_engine=chosen_engine,
+                        sovits_url=sovits_url,
                     )
                     try:
                         conversation = Conversation(
@@ -659,6 +669,15 @@ if __name__ == "__main__":
         default=TTS_SAMPLE_STEPS,
         help="GPT-SoVITS v4 sampling steps",
     )
+    parser.add_argument(
+        "--sovits-url",
+        type=str,
+        default=None,
+        help="GPT-SoVITS service URL (overrides SOVITS_URL env var and Config default)",
+    )
     args = parser.parse_args()
     app.state.tts_steps = args.tts_steps
+    if args.sovits_url:
+        app.state.sovits_url = args.sovits_url
+        os.environ["SOVITS_URL"] = args.sovits_url
     uvicorn.run(app, host="127.0.0.1", port=args.port)
