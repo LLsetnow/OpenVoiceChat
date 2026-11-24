@@ -78,6 +78,8 @@
       history_open_failed: "无法打开这条历史对话，请刷新后重试。",
       history_missing: "这条历史对话已不存在，请新建对话后重试。",
       new_conversation: "新对话",
+      db_migration_failed: "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+      db_migration_recovery: "请运行 python -m openvoicechat.migrate 恢复数据库。",
 
       // 对话面板
       dialogue_title: "对话记录",
@@ -213,6 +215,8 @@
       history_open_failed: "Could not open this conversation. Refresh and try again.",
       history_missing: "This conversation no longer exists. Start a new one and try again.",
       new_conversation: "New conversation",
+      db_migration_failed: "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+      db_migration_recovery: "Please run python -m openvoicechat.migrate to restore the database.",
 
       // Dialogue panel
       dialogue_title: "Conversation",

@@ -25,6 +25,7 @@ from openvoicechat.history import (
     get_conversation,
     list_conversations,
 )
+from openvoicechat.migrate import DatabaseMigrationError, migrate
 from run_voice_chat import DEFAULT_PROMPT, VoiceConfigurationError, voice_profile
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -33,12 +34,63 @@ log = logging.getLogger(__name__)
 audio_in_use = asyncio.Lock()
 active_session_stop = None
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+def run_startup_migrations(target_app: FastAPI) -> dict:
+    try:
+        applied = migrate()
+        status = {
+            "status": "ready",
+            "applied": applied,
+            "error": None,
+            "message_zh": "数据库就绪",
+            "message_en": "Database ready",
+        }
+        target_app.state.database_status = status
+        target_app.state.migration_error = None
+        if applied:
+            log.info("Applied conversation database migrations on startup: %s", applied)
+        else:
+            log.info("Conversation database is up to date on startup.")
+        return status
+    except (DatabaseMigrationError, OSError, RuntimeError) as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        status = {
+            "status": "error",
+            "applied": [],
+            "error": error_msg,
+            "recovery": "python -m openvoicechat.migrate",
+            "message_zh": "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+            "message_en": "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+        }
+        target_app.state.database_status = status
+        target_app.state.migration_error = error_msg
+        log.error(
+            "Failed to apply database migrations on startup: %s. Recovery: python -m openvoicechat.migrate",
+            exc,
+        )
+        return status
+
+
+def ensure_database_ready(target_app: FastAPI) -> dict:
+    status = getattr(target_app.state, "database_status", None)
+    if status is None or status.get("status") == "error":
+        status = run_startup_migrations(target_app)
+    return status
+
+
+@contextlib.asynccontextmanager
+async def lifespan(target_app: FastAPI):
+    run_startup_migrations(target_app)
+    yield
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.state.tts_steps = TTS_SAMPLE_STEPS
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
+app.state.database_status = None
+app.state.migration_error = None
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$",
+    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost|testserver)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,13 +108,60 @@ async def api_characters():
     return {"characters": list_characters(), "default": get_default_character().__dict__}
 
 
+@app.get("/api/status")
+async def api_status():
+    status = ensure_database_ready(app)
+    return {
+        "status": "ready" if status.get("status") == "ready" else "degraded",
+        "database": status,
+    }
+
+
 @app.get("/api/conversations")
 async def api_conversations():
+    status = ensure_database_ready(app)
+    if status.get("status") == "error":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "database_migration_failed",
+                "message_key": "db_migration_failed",
+                "message": status.get(
+                    "message_zh",
+                    "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+                ),
+                "message_en": status.get(
+                    "message_en",
+                    "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+                ),
+                "recovery": status.get("recovery", "python -m openvoicechat.migrate"),
+                "detail": status.get("error"),
+            },
+        )
     return {"conversations": list_conversations()}
 
 
 @app.get("/api/conversations/{conversation_id}")
 async def api_conversation(conversation_id: str):
+    status = ensure_database_ready(app)
+    if status.get("status") == "error":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "database_migration_failed",
+                "message_key": "db_migration_failed",
+                "message": status.get(
+                    "message_zh",
+                    "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+                ),
+                "message_en": status.get(
+                    "message_en",
+                    "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+                ),
+                "recovery": status.get("recovery", "python -m openvoicechat.migrate"),
+                "detail": status.get("error"),
+            },
+        )
     conversation = get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="conversation_not_found")
@@ -105,7 +204,7 @@ async def api_voices():
 async def session(websocket: WebSocket):
     origin = websocket.headers.get("origin") or ""
     host = websocket.headers.get("host") or ""
-    allowed = origin == f"http://{host}" or origin.startswith(("http://127.0.0.1:", "http://localhost:"))
+    allowed = origin == f"http://{host}" or origin.startswith(("http://127.0.0.1:", "http://localhost:", "http://testserver"))
     if not allowed:
         await websocket.close(code=1008)
         return
@@ -167,7 +266,10 @@ async def session(websocket: WebSocket):
         if role == "error":
             publish("error", message="本轮对话失败，请再说一次。")
         else:
-            append_message(conversation_id, role, text)
+            try:
+                append_message(conversation_id, role, text)
+            except (DatabaseMigrationError, OSError, RuntimeError) as exc:
+                log.error("Failed to append message to conversation: %s", exc)
             publish("message", role=role, text=text)
 
     async def start_voice(
@@ -203,17 +305,51 @@ async def session(websocket: WebSocket):
         if char is None:
             char = get_default_character()
 
-        saved_conversation = get_conversation(conversation_id) if conversation_id else None
-        if conversation_id and saved_conversation is None:
-            publish("error", message_key="history_missing")
+        db_status = ensure_database_ready(websocket.app)
+        if db_status.get("status") == "error":
+            publish(
+                "error",
+                message_key="db_migration_failed",
+                code="DATABASE_MIGRATION_FAILED",
+                message=db_status.get(
+                    "message_zh",
+                    "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+                ),
+                message_en=db_status.get(
+                    "message_en",
+                    "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+                ),
+                recovery=db_status.get("recovery", "python -m openvoicechat.migrate"),
+                detail=db_status.get("error"),
+            )
             publish("state", state="idle")
             return
-        if saved_conversation is None:
-            saved_conversation = create_conversation(character_id or "mio", char.name)
-        elif not character_id:
-            character_id = saved_conversation["character_id"]
-        session_conversation_id = saved_conversation["id"]
-        publish("conversation", id=session_conversation_id)
+
+        try:
+            saved_conversation = get_conversation(conversation_id) if conversation_id else None
+            if conversation_id and saved_conversation is None:
+                publish("error", message_key="history_missing")
+                publish("state", state="idle")
+                return
+            if saved_conversation is None:
+                saved_conversation = create_conversation(character_id or "mio", char.name)
+            elif not character_id:
+                character_id = saved_conversation["character_id"]
+            session_conversation_id = saved_conversation["id"]
+            publish("conversation", id=session_conversation_id)
+        except (DatabaseMigrationError, OSError, RuntimeError) as exc:
+            log.error("Failed to access or initialize conversation: %s", exc)
+            publish(
+                "error",
+                message_key="db_migration_failed",
+                code="DATABASE_INIT_FAILED",
+                message=f"数据库访问或初始化失败：{exc}。请运行 python -m openvoicechat.migrate 手动恢复。",
+                message_en=f"Database access or initialization failed: {exc}. Run python -m openvoicechat.migrate to recover.",
+                recovery="python -m openvoicechat.migrate",
+                detail=str(exc),
+            )
+            publish("state", state="idle")
+            return
 
         chosen_voice = voice_override or char.voice or TTS_VOICE
         chosen_engine = engine_override or char.tts_engine or "gpt_sovits"
@@ -273,6 +409,23 @@ async def session(websocket: WebSocket):
 
     sender = asyncio.create_task(send_events())
     publish("state", state="idle")
+    db_status = ensure_database_ready(websocket.app)
+    if db_status.get("status") == "error":
+        publish(
+            "error",
+            message_key="db_migration_failed",
+            code="DATABASE_MIGRATION_FAILED",
+            message=db_status.get(
+                "message_zh",
+                "数据库迁移失败，请检查写入权限后运行 python -m openvoicechat.migrate 手动恢复。",
+            ),
+            message_en=db_status.get(
+                "message_en",
+                "Database migration failed. Please check write permissions and run python -m openvoicechat.migrate to recover.",
+            ),
+            recovery=db_status.get("recovery", "python -m openvoicechat.migrate"),
+            detail=db_status.get("error"),
+        )
     try:
         while True:
             message = await websocket.receive()
