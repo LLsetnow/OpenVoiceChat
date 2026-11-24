@@ -5,14 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f3f5ef">
   <title>语音对话 · OpenVoiceChat</title>
-  <link rel="stylesheet" href="/assets/voice.css?v=1.2.0">
-  <script src="/assets/i18n.js?v=1.0.0" defer></script>
-  <script src="/assets/voice.js?v=1.2.0" defer></script>
+  <link rel="stylesheet" href="assets/voice.css?v=1.2.0">
+  <script src="assets/i18n.js?v=1.2.1" defer></script>
+  <script src="assets/voice.js?v=1.3.1" defer></script>
 </head>
 <body>
   <div class="page">
-    <aside class="character-rail" aria-label="角色立绘">
-      <img data-avatar src="/assets/img/chinatsu.png" alt="千夏全身立绘">
+    <aside class="character-rail" data-i18n-aria-label="character_rail_label" aria-label="角色立绘">
+      <img data-avatar src="assets/img/chinatsu.png" data-i18n-alt="avatar_alt" alt="千夏全身立绘">
     </aside>
 
     <main class="shell">
@@ -22,37 +22,37 @@
         OpenVoiceChat
       </div>
       <p class="session-state" id="session-state" data-state="connecting" role="status">
-        <span class="state-dot" aria-hidden="true"></span><span id="state-label">正在连接</span>
+        <span class="state-dot" aria-hidden="true"></span><span id="state-label" data-i18n="state_connecting">正在连接</span>
       </p>
     </header>
 
     <section class="intro" aria-labelledby="page-title">
       <figure class="character-stage">
-        <img data-avatar src="/assets/img/chinatsu.png" alt="千夏全身立绘">
+        <img data-avatar src="assets/img/chinatsu.png" data-i18n-alt="avatar_alt" alt="千夏全身立绘">
       </figure>
       <div class="intro-content">
         <div>
-          <h1 id="page-title">语音对话 · <span id="char-name-display">千夏</span></h1>
-          <p id="page-desc">支持免提扬声器播放与回声抑制，无需佩戴耳机即可流畅对话。</p>
+          <h1 id="page-title"><span data-i18n="page_title_prefix">语音对话 · </span><span id="char-name-display" data-i18n="assistant_default_name">千夏</span></h1>
+          <p id="page-desc" data-i18n="page_desc">支持免提扬声器播放与回声抑制，无需佩戴耳机即可流畅对话。</p>
           <div class="character-select-row">
-            <label for="char-select">角色设定:
+            <label for="char-select"><span data-i18n="char_select_label">角色设定:</span>
               <select id="char-select">
-                <option value="mio">千夏 (表妹恋人)</option>
+                <option value="mio" data-i18n="char_mio_desc">千夏 (表妹恋人)</option>
               </select>
             </label>
-            <label for="tts-engine-select">语音引擎:
+            <label for="tts-engine-select"><span data-i18n="tts_engine_select_label">语音引擎:</span>
               <select id="tts-engine-select">
-                <option value="gpt_sovits" selected>AiServer GPT-SoVITS</option>
-                <option value="cosyvoice">阿里云 CosyVoice</option>
+                <option value="gpt_sovits" selected data-i18n="engine_sovits">AiServer GPT-SoVITS</option>
+                <option value="cosyvoice" data-i18n="engine_cosyvoice">阿里云 CosyVoice</option>
               </select>
             </label>
-            <label for="voice-select">音色:
+            <label for="voice-select"><span data-i18n="voice_select_label">音色:</span>
               <select id="voice-select">
-                <option value="chinatsu" selected>千夏 (chinatsu)</option>
-                <option value="ling">铃 (ling)</option>
-                <option value="zhe">哲 (zhe)</option>
-                <option value="nangongyu">南宫羽 (nangongyu)</option>
-                <option value="remielle">雷米埃尔 (remielle)</option>
+                <option value="chinatsu" selected data-i18n="voice_chinatsu">千夏 (chinatsu)</option>
+                <option value="ling" data-i18n="voice_ling">铃 (ling)</option>
+                <option value="zhe" data-i18n="voice_zhe">哲 (zhe)</option>
+                <option value="nangongyu" data-i18n="voice_nangongyu">南宫羽 (nangongyu)</option>
+                <option value="remielle" data-i18n="voice_remielle">雷米埃尔 (remielle)</option>
               </select>
             </label>
           </div>
@@ -60,27 +60,27 @@
       </div>
       <button id="toggle" type="button" disabled>
         <span id="toggle-icon" class="control-icon" aria-hidden="true"></span>
-        <span id="toggle-label" data-i18n="start_chat"></span>
+        <span id="toggle-label" data-i18n="start_chat">开始对话</span>
       </button>
     </section>
     <p class="alert" id="alert" role="alert" hidden></p>
 
-    <section class="panel audio-devices" aria-label="音频设备">
-      <label for="audio-input">麦克风
-        <select id="audio-input" disabled><option>正在识别设备</option></select>
+    <section class="panel audio-devices" data-i18n-aria-label="audio_devices_label" aria-label="音频设备">
+      <label for="audio-input"><span data-i18n="audio_input_label">麦克风</span>
+        <select id="audio-input" disabled><option data-i18n="identifying_devices">正在识别设备</option></select>
       </label>
-      <label for="audio-output">声音输出
-        <select id="audio-output" disabled><option>正在识别设备</option></select>
+      <label for="audio-output"><span data-i18n="audio_output_label">声音输出</span>
+        <select id="audio-output" disabled><option data-i18n="identifying_devices">正在识别设备</option></select>
       </label>
-      <button class="refresh" id="refresh-devices" type="button" disabled>刷新设备</button>
+      <button class="refresh" id="refresh-devices" type="button" disabled data-i18n="refresh_devices">刷新设备</button>
       <div class="speaker-mode">
-        <label for="voice-mode">对话模式
+        <label for="voice-mode"><span data-i18n="voice_mode_label">对话模式</span>
           <select id="voice-mode">
-            <option value="speaker" selected>扬声器防回声（推荐免提 · 绝不误断）</option>
-            <option value="barge_in">智能免提打断（千夏说话时可开口打断）</option>
+            <option value="speaker" selected data-i18n="mode_speaker">扬声器防回声（推荐免提 · 绝不误断）</option>
+            <option value="barge_in" data-i18n="mode_barge_in">智能免提打断（千夏说话时可开口打断）</option>
           </select>
         </label>
-        <span id="speaker-mode-hint">千夏播放时自动暂停麦克风，播完秒开，彻底杜绝回声打断</span>
+        <span id="speaker-mode-hint" data-i18n="speaker_mode_hint">千夏播放时自动暂停麦克风，播完秒开，彻底杜绝回声打断</span>
       </div>
       <p id="device-note" role="status" hidden></p>
     </section>
@@ -88,47 +88,47 @@
     <div class="workspace">
       <aside class="panel history-panel" aria-labelledby="history-title">
         <header class="panel-header history-header">
-          <h2 id="history-title"><span data-i18n="history_title"></span></h2>
-          <button class="new-chat" id="new-conversation" type="button" data-i18n="new_chat"></button>
+          <h2 id="history-title" data-i18n="history_title">历史对话</h2>
+          <button class="new-chat" id="new-conversation" type="button" data-i18n="new_chat">新建</button>
         </header>
-        <div class="history-list" id="history-list" data-i18n-aria-label="history_title">
-          <p class="history-empty" data-i18n="loading_history"></p>
+        <div class="history-list" id="history-list" data-i18n-aria-label="history_title" aria-label="历史对话">
+          <p class="history-empty" data-i18n="loading_history">正在加载记录…</p>
         </div>
       </aside>
 
       <section class="panel dialogue" aria-labelledby="dialogue-title">
         <header class="panel-header">
-          <h2 id="dialogue-title">对话记录</h2>
+          <h2 id="dialogue-title" data-i18n="dialogue_title">对话记录</h2>
           <span id="turn-state" class="turn-state" role="status"></span>
         </header>
-        <div class="scroll" id="scroll" tabindex="0" aria-label="对话字幕">
+        <div class="scroll" id="scroll" tabindex="0" data-i18n-aria-label="dialogue_subtitles_label" aria-label="对话字幕">
           <div class="empty" id="empty">
             <span class="wave empty-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
-            <p id="empty-title">还没有对话</p>
-            <p id="empty-hint">点击开始对话，说一句试试。</p>
+            <p id="empty-title" data-i18n="empty_title">还没有对话</p>
+            <p id="empty-hint" data-i18n="empty_hint">点击开始对话，说一句试试。</p>
           </div>
           <div class="messages" id="messages"></div>
         </div>
-        <footer class="panel-footer" id="mic-hint">免提监听中，千夏说话时可随时开口打断。</footer>
+        <footer class="panel-footer" id="mic-hint" data-i18n="mic_hint_default">免提监听中，千夏说话时可随时开口打断。</footer>
       </section>
 
       <aside class="panel timings" aria-labelledby="timing-title">
-        <header class="panel-header"><h2 id="timing-title">本轮耗时</h2></header>
+        <header class="panel-header"><h2 id="timing-title" data-i18n="timing_title">本轮耗时</h2></header>
         <dl class="timing-list">
           <div class="metric" id="asr-row">
-            <dt><span>ASR</span> 语音识别</dt>
+            <dt><span>ASR</span> <span data-i18n="metric_asr">语音识别</span></dt>
             <dd id="asr">—</dd>
-            <dd class="metric-hint">判停到最终转写</dd>
+            <dd class="metric-hint" data-i18n="metric_asr_hint">判停到最终转写</dd>
           </div>
           <div class="metric" id="llm-row">
-            <dt><span>LLM</span> 生成首段</dt>
+            <dt><span>LLM</span> <span data-i18n="metric_llm">生成首段</span></dt>
             <dd id="llm">—</dd>
-            <dd class="metric-hint" id="llm-sub">DeepSeek Flash</dd>
+            <dd class="metric-hint" id="llm-sub" data-i18n="metric_llm_sub">DeepSeek Flash</dd>
           </div>
           <div class="metric" id="tts-row">
-            <dt><span>TTS</span> 合成首段</dt>
+            <dt><span>TTS</span> <span data-i18n="metric_tts">合成首段</span></dt>
             <dd id="tts">—</dd>
-            <dd class="metric-hint">GPT-SoVITS · 千夏</dd>
+            <dd class="metric-hint" id="tts-sub" data-i18n="metric_tts_sub">GPT-SoVITS · 千夏</dd>
           </div>
         </dl>
       </aside>
