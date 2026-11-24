@@ -11,6 +11,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.websockets import WebSocketDisconnected
 
@@ -35,6 +36,13 @@ active_session_stop = None
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.state.tts_steps = TTS_SAMPLE_STEPS
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
 
 
@@ -95,7 +103,10 @@ async def api_voices():
 
 @app.websocket("/session")
 async def session(websocket: WebSocket):
-    if websocket.headers.get("origin") != f"http://{websocket.headers.get('host')}":
+    origin = websocket.headers.get("origin") or ""
+    host = websocket.headers.get("host") or ""
+    allowed = origin == f"http://{host}" or origin.startswith(("http://127.0.0.1:", "http://localhost:"))
+    if not allowed:
         await websocket.close(code=1008)
         return
     await websocket.accept()

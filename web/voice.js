@@ -2,21 +2,34 @@ const element = (id) => document.getElementById(id);
 const button = element("toggle");
 const messages = element("messages");
 const scroller = element("scroll");
-const names = { user: "你", assistant: "千夏" };
+const t = (key, params) => (window.ovcI18n ? window.ovcI18n.translate(key, params) : key);
+const names = {
+  get user() {
+    return t("user_name");
+  },
+  assistant: window.ovcI18n ? window.ovcI18n.t("assistant_default_name") : "千夏",
+};
 const stageNames = ["asr", "llm", "tts"];
 const charSelect = element("char-select");
 const ttsEngineSelect = element("tts-engine-select");
 const voiceSelect = element("voice-select");
 const historyList = element("history-list");
 const newConversationButton = element("new-conversation");
-const t = key => window.ovcI18n.translate(key);
 const avatars = () => document.querySelectorAll("[data-avatar]");
 function setAvatar(src) {
+  if (src && typeof src === "string" && src.startsWith("/assets/")) {
+    src = src.slice(1);
+  }
   for (const img of avatars()) img.src = src;
 }
 const charNameDisplay = element("char-name-display");
 
-let charactersData = [];
+const apiBase = (location.port === "18768" || !location.port) ? "" : "http://127.0.0.1:18768";
+const wsHost = (location.port === "18768" || !location.port) ? location.host : "127.0.0.1:18768";
+
+let charactersData = [
+  { id: "mio", name: "千夏", avatar: "assets/img/chinatsu.png", voice: "chinatsu", tts_engine: "gpt_sovits" }
+];
 let conversationData = [];
 let selectedConversationId = null;
 let voicesData = {
@@ -36,9 +49,26 @@ let voicesData = {
   ]
 };
 
+function getCharacterName(c) {
+  if (!c) return t("assistant_default_name");
+  if (c.name === "千夏" || c.id === "mio" || c.id === "example") {
+    return t("assistant_default_name");
+  }
+  return c.name || c.id;
+}
+
+function getVoiceDisplayName(v) {
+  const key = `voice_${v.id.replace(/_v2$/, "")}`;
+  const translated = t(key);
+  if (translated && translated !== key) {
+    return translated;
+  }
+  return `${v.name} (${v.id})`;
+}
+
 async function fetchVoicesAndCharacters() {
   try {
-    const resChars = await fetch("/api/characters");
+    const resChars = await fetch(`${apiBase}/api/characters`);
     if (resChars.ok) {
       const data = await resChars.json();
       charactersData = data.characters || [];
@@ -49,7 +79,7 @@ async function fetchVoicesAndCharacters() {
   }
 
   try {
-    const resVoices = await fetch("/api/voices");
+    const resVoices = await fetch(`${apiBase}/api/voices`);
     if (resVoices.ok) {
       voicesData = await resVoices.json();
       updateVoiceOptions();
@@ -70,7 +100,14 @@ function populateCharacters(chars) {
   for (const c of chars) {
     const opt = document.createElement("option");
     opt.value = c.id;
-    opt.textContent = `${c.name} (${c.id})`;
+    if (c.id === "mio") {
+      opt.textContent = t("char_mio_desc");
+    } else if (c.id === "example") {
+      opt.textContent = t("char_example_desc");
+    } else {
+      const charName = getCharacterName(c);
+      opt.textContent = `${charName} (${c.id})`;
+    }
     charSelect.appendChild(opt);
   }
   applyCharacter(chars[0]);
@@ -78,8 +115,8 @@ function populateCharacters(chars) {
 
 function applyCharacter(c) {
   if (!c) return;
-  names.assistant = c.name || "千夏";
-  if (charNameDisplay) charNameDisplay.textContent = c.name || "千夏";
+  names.assistant = getCharacterName(c);
+  if (charNameDisplay) charNameDisplay.textContent = names.assistant;
   if (c.avatar) setAvatar(c.avatar);
   if (c.tts_engine) {
     ttsEngineSelect.value = c.tts_engine;
@@ -87,6 +124,11 @@ function applyCharacter(c) {
   }
   if (c.voice) {
     voiceSelect.value = c.voice;
+  }
+  const ttsSub = element("tts-sub");
+  if (ttsSub) {
+    const engineLabel = c.tts_engine === "cosyvoice" ? "CosyVoice" : "GPT-SoVITS";
+    ttsSub.textContent = `${engineLabel} · ${names.assistant}`;
   }
   updateMicStatus();
 }
@@ -98,7 +140,7 @@ function updateVoiceOptions() {
   for (const v of list) {
     const opt = document.createElement("option");
     opt.value = v.id;
-    opt.textContent = `${v.name} (${v.id})`;
+    opt.textContent = getVoiceDisplayName(v);
     voiceSelect.appendChild(opt);
   }
 }
@@ -116,6 +158,8 @@ if (ttsEngineSelect) {
   });
 }
 
+populateCharacters(charactersData);
+updateVoiceOptions();
 fetchVoicesAndCharacters();
 
 const drafts = new Map();
@@ -207,11 +251,11 @@ function updateControls() {
   for (const select of Object.values(devices)) select.disabled = !canChoose;
   voiceMode.disabled = !idle;
   refresh.disabled = !idle || loadingDevices;
-  refresh.textContent = loadingDevices ? "正在识别…" : "刷新设备";
+  refresh.textContent = loadingDevices ? t("refresh_identifying") : t("refresh_devices");
   const note = element("device-note");
   note.textContent = deviceError || (
-    state === "running" ? "停止对话后可以更换设备或模式。" :
-      canChoose && !valid ? "所选设备不可用。请选择其他设备，或连接后刷新。" : ""
+    state === "running" ? t("device_note_running") :
+      canChoose && !valid ? t("device_note_invalid") : ""
   );
   note.hidden = !note.textContent;
   if (newConversationButton) newConversationButton.disabled = state !== "idle";
@@ -228,7 +272,7 @@ function updateControls() {
 async function refreshConversationList() {
   if (!historyList) return;
   try {
-    const response = await fetch("/api/conversations");
+    const response = await fetch(`${apiBase}/api/conversations`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     conversationData = data.conversations || [];
@@ -278,7 +322,7 @@ async function refreshConversationList() {
 async function openConversation(id) {
   if (state !== "idle" && state !== "connecting") return;
   try {
-    const response = await fetch(`/api/conversations/${encodeURIComponent(id)}`);
+    const response = await fetch(`${apiBase}/api/conversations/${encodeURIComponent(id)}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const conversation = await response.json();
     selectedConversationId = conversation.id;
@@ -318,54 +362,54 @@ function updateMicStatus() {
 
   element("session-state").dataset.paused = String(shouldPause);
 
+  const asstName = names.assistant || t("assistant_default_name");
   if (state === "running") {
-    let label = "可以说话";
+    let label = t("turn_can_speak_lbl", { name: asstName });
     let hint = "";
-    const asstName = names.assistant || "Mio";
     if (isSpeakerMode) {
       if (isAudioPlaying || isInterSentencePause) {
-        label = `${asstName}正在说话（麦克风已自动暂停）`;
-        hint = `${asstName}正在回答中，请听完后再说话（播完会自动开麦）。`;
+        label = t("turn_speaking_paused_lbl", { name: asstName });
+        hint = t("turn_speaking_paused_hnt", { name: asstName });
       } else if (inTailHangover) {
-        label = `${asstName}播完（回声吸收中…）`;
-        hint = "正在消除房间尾音回响，马上开麦…";
+        label = t("turn_absorbing_lbl", { name: asstName });
+        hint = t("turn_absorbing_hnt", { name: asstName });
       } else if (waitingReply) {
-        label = `${asstName}正在思考回复`;
-        hint = `${asstName}正在准备回复，请稍候。`;
+        label = t("turn_thinking_lbl", { name: asstName });
+        hint = t("turn_thinking_hnt", { name: asstName });
       } else {
-        label = "可以说话（麦克风已开启）";
-        hint = `请开口说话，说完整句话后${asstName}会自动回答。`;
+        label = t("turn_can_speak_lbl", { name: asstName });
+        hint = t("turn_can_speak_hnt", { name: asstName });
       }
     } else {
       // 智能免提打断模式
       if (isAudioPlaying) {
-        label = `${asstName}正在说话（可随时开口打断）`;
-        hint = `智能回声过滤已开启，你只要开口说话即可随时打断${asstName}。`;
+        label = t("turn_barge_speaking_lbl", { name: asstName });
+        hint = t("turn_barge_speaking_hnt", { name: asstName });
       } else if (isInterSentencePause) {
-        label = `${asstName}正在继续回答…`;
-        hint = `${asstName}正在组织下一句话…`;
+        label = t("turn_barge_continuing_lbl", { name: asstName });
+        hint = t("turn_barge_continuing_hnt", { name: asstName });
       } else if (inTailHangover) {
-        label = `${asstName}播完（回声吸收中…）`;
-        hint = "智能尾音消除中，马上恢复监听…";
+        label = t("turn_barge_absorbing_lbl", { name: asstName });
+        hint = t("turn_barge_absorbing_hnt", { name: asstName });
       } else if (waitingReply) {
-        label = `${asstName}正在准备回复`;
-        hint = `${asstName}正在思考回复。`;
+        label = t("turn_barge_thinking_lbl", { name: asstName });
+        hint = t("turn_barge_thinking_hnt", { name: asstName });
       } else {
-        label = "免提监听中（随时说话）";
-        hint = "免提监听中，你可以随时说话。";
+        label = t("turn_barge_listening_lbl", { name: asstName });
+        hint = t("turn_barge_listening_hnt", { name: asstName });
       }
     }
     element("state-label").textContent = label;
     element("mic-hint").textContent = hint;
   } else {
     element("mic-hint").textContent = isSpeakerMode ?
-      "扬声器防回声模式：千夏播放及尾音期间自动暂停麦克风，彻底杜绝回声打断与尾音误触发。" :
-      "智能免提打断模式：说话时支持随时开口打断，播完智能吸收房间尾音，彻底消除尾音误识别。";
+      t("speaker_mode_title", { name: asstName }) :
+      t("barge_mode_title", { name: asstName });
   }
 
   element("speaker-mode-hint").textContent = isSpeakerMode ?
-    "千夏播放及尾音期间自动暂停麦克风，彻底杜绝回声打断与尾音误触发" :
-    "说话时支持随时开口打断，播完智能吸收房间尾音，消除尾音误识别";
+    t("speaker_select_hint", { name: asstName }) :
+    t("barge_select_hint", { name: asstName });
 }
 
 async function requestDevices() {
@@ -380,20 +424,20 @@ async function requestDevices() {
 
       const inputDevices = inputs.map((d, i) => ({
         id: d.deviceId,
-        label: d.label || (inputs.length === 1 ? "默认麦克风" : `麦克风 ${i + 1}`),
+        label: d.label || (inputs.length === 1 ? t("default_microphone") : t("microphone_indexed", { index: i + 1 })),
       }));
       const outputDevices = outputs.map((d, i) => ({
         id: d.deviceId,
-        label: d.label || (outputs.length === 1 ? "默认扬声器" : `扬声器 ${i + 1}`),
+        label: d.label || (outputs.length === 1 ? t("default_speaker") : t("speaker_indexed", { index: i + 1 })),
       }));
 
       const catalogue = {
         input: {
-          default: inputDevices.length > 0 ? inputDevices[0].label : "默认麦克风",
+          default: inputDevices.length > 0 ? inputDevices[0].label : t("default_microphone"),
           devices: inputDevices,
         },
         output: {
-          default: outputDevices.length > 0 ? outputDevices[0].label : "默认扬声器",
+          default: outputDevices.length > 0 ? outputDevices[0].label : t("default_speaker"),
           devices: outputDevices,
         },
       };
@@ -413,7 +457,10 @@ function showDevices(catalogue) {
   for (const [kind, select] of Object.entries(devices)) {
     const group = catalogue[kind];
     if (!group) continue;
-    const defaultOption = new Option(group.default ? `系统默认 · ${group.default}` : "系统默认", "");
+    const defaultOption = new Option(
+      group.default ? t("system_default_named", { name: group.default }) : t("system_default"),
+      ""
+    );
     const options = group.devices.map(({ id, label }) => new Option(label, id));
     let choice = selectedDevices[kind];
     if (choice && !group.devices.some(({ id }) => id === choice)) {
@@ -677,13 +724,17 @@ function setState(next) {
     }
   }
   const isSpeakerMode = voiceMode.value === "speaker";
+  const asstName = names.assistant || t("assistant_default_name");
   const states = {
-    connecting: ["正在连接", "开始对话"],
-    offline: ["连接已断开", "开始对话"],
-    idle: ["麦克风已停止", "开始对话"],
-    starting: ["正在打开麦克风", "正在启动"],
-    running: [isSpeakerMode ? "可以说话（麦克风已开启）" : "免提监听中（随时说话）", "停止对话"],
-    stopping: ["正在停止", "正在停止"],
+    connecting: [t("state_connecting"), t("start_chat")],
+    offline: [t("state_offline"), t("start_chat")],
+    idle: [t("state_idle"), selectedConversationId ? t("continue_chat") : t("start_chat")],
+    starting: [t("state_starting"), t("state_starting_btn")],
+    running: [
+      isSpeakerMode ? t("turn_can_speak_lbl", { name: asstName }) : t("turn_barge_listening_lbl", { name: asstName }),
+      t("stop_chat")
+    ],
+    stopping: [t("state_stopping"), t("state_stopping")],
   };
   const [status, action] = states[state];
   element("session-state").dataset.state = state;
@@ -805,18 +856,18 @@ function onEvent(event) {
       notice();
       finishDrafts();
       for (const stage of stageNames) element(stage).textContent = "—";
-      element("llm-sub").textContent = "DeepSeek Flash";
-      phase("正在识别", "asr");
+      element("llm-sub").textContent = t("metric_llm_sub");
+      phase(t("phase_asr_recognizing"), "asr");
       break;
     case "endpoint":
-      phase("正在获取最终转写", "asr");
+      phase(t("phase_asr_finalizing"), "asr");
       break;
     case "user_partial": showMessage("user", event.text, true); break;
     case "assistant_partial": showMessage("assistant", event.text, true); break;
     case "character_info":
       if (event.name) {
-        names.assistant = event.name;
-        if (charNameDisplay) charNameDisplay.textContent = event.name;
+        names.assistant = (event.name === "千夏" || event.name === "mio") ? t("assistant_default_name") : event.name;
+        if (charNameDisplay) charNameDisplay.textContent = names.assistant;
       }
       if (event.avatar) setAvatar(event.avatar);
       break;
@@ -829,10 +880,10 @@ function onEvent(event) {
     case "message":
       showMessage(event.role, event.text, false);
       refreshConversationList();
-      if (event.role === "user") phase(`${names.assistant}正在生成回复`, "llm");
+      if (event.role === "user") phase(t("phase_llm_generating", { name: names.assistant }), "llm");
       if (event.role === "assistant") phase("");
       break;
-    case "tts_start": phase("正在合成千夏的语音", "tts"); break;
+    case "tts_start": phase(t("phase_tts_synthesizing", { name: names.assistant }), "tts"); break;
     case "output_complete":
       serverGenerating = false;
       checkTurnCompletion();
@@ -840,7 +891,7 @@ function onEvent(event) {
     case "timing":
       if (!Number.isFinite(event.milliseconds)) break;
       if (event.stage === "llm_first") {
-        element("llm-sub").textContent = `首 token ${duration(event.milliseconds)}`;
+        element("llm-sub").textContent = t("metric_first_token", { ms: duration(event.milliseconds) });
       } else if (stageNames.includes(event.stage)) {
         element(`${event.stage}-row`).dataset.pending = "false";
         element(event.stage).textContent = duration(event.milliseconds);
@@ -852,23 +903,23 @@ function onEvent(event) {
       drafts.get("user")?.remove();
       drafts.delete("user");
       element("empty").hidden = messages.children.length > 0;
-      phase("可以继续说话");
+      phase(t("phase_can_continue"));
       break;
     case "empty_reply":
       serverGenerating = false;
-      phase("这轮没有生成回复，可以继续说话");
+      phase(t("phase_no_reply"));
       break;
     case "interrupted":
       serverGenerating = false;
       stopAudioPlayback();
       finishDrafts();
-      phase("已打断，千夏正在聆听");
+      phase(t("phase_interrupted", { name: names.assistant }));
       break;
   }
 }
 
 function connect() {
-  socket = new WebSocket(`ws://${location.host}/session`);
+  socket = new WebSocket(`ws://${wsHost}/session`);
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
     socket.send(JSON.stringify({ action: "init" }));
@@ -917,7 +968,7 @@ button.addEventListener("click", async () => {
       }));
     } catch (err) {
       console.error("Failed to start audio recording", err);
-      notice(`麦克风启动失败：${err.message || err}。请检查浏览器麦克风权限。`);
+      notice(t("mic_error", { error: err.message || err }));
       stopAudioRecording();
       setState("idle");
     }
