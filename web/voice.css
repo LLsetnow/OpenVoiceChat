@@ -279,6 +279,7 @@ h2 { font-size: 15px; font-weight: 670; }
 .metric dd { font-family: var(--mono); color: var(--ink); font-size: 18px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .metric .metric-hint { grid-column: 1 / -1; color: var(--muted); font: inherit; font-size: 12px; }
 .metric[data-pending="true"] dd:not(.metric-hint) { color: var(--green); }
+.metric[hidden] { display: none !important; }
 
 @media (max-width: 1099px) {
   .page { display: block; min-height: 0; }

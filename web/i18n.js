@@ -17,6 +17,9 @@
       // 角色与引擎
       char_select_label: "角色设定:",
       tts_engine_select_label: "语音引擎:",
+      tts_steps_select_label: "推理步数:",
+      steps_4: "4 步 (极速低延迟)",
+      steps_8: "8 步 (默认高音质)",
       voice_select_label: "音色:",
       char_mio_desc: "千夏 (表妹恋人)",
       char_example_desc: "千夏 (标准助手)",
@@ -108,6 +111,12 @@
       metric_tts: "合成首段",
       metric_tts_sub: "GPT-SoVITS · {name}",
       metric_first_token: "首 token {ms}",
+      metric_network: "网络排队",
+      metric_network_hint: "传输与调度等待",
+      metric_playback: "首段播放",
+      metric_playback_hint: "端到端真实开始发声",
+      metric_interrupt: "插话停止",
+      metric_interrupt_hint: "打断响应与音轨清空",
 
       // 实时交互状态
       turn_can_speak_lbl: "可以说话（麦克风已开启）",
@@ -137,6 +146,7 @@
       phase_can_continue: "可以继续说话",
       phase_no_reply: "这轮没有生成回复，可以继续说话",
       phase_interrupted: "已打断，{name}正在聆听",
+      phase_interrupted_with_time: "已打断（停止耗时 {ms}ms），{name}正在聆听",
       retry_read: "重试朗读",
       retry_read_aria: "重新朗读此条回复",
       tts_error_notice: "语音合成超时或失败，已保留文字回复，可点击重试朗读。",
@@ -160,6 +170,9 @@
       // Character & engines
       char_select_label: "Character:",
       tts_engine_select_label: "TTS Engine:",
+      tts_steps_select_label: "Inference Steps:",
+      steps_4: "4 Steps (Fast, Low Latency)",
+      steps_8: "8 Steps (Default, High Quality)",
       voice_select_label: "Voice:",
       char_mio_desc: "Chinatsu (Cousin & Sweetheart)",
       char_example_desc: "Chinatsu (Default Assistant)",
@@ -251,6 +264,12 @@
       metric_tts: "First Audio Chunk",
       metric_tts_sub: "GPT-SoVITS · {name}",
       metric_first_token: "First token {ms}",
+      metric_network: "Network Queue",
+      metric_network_hint: "Transfer & buffer delay",
+      metric_playback: "First Chunk Play",
+      metric_playback_hint: "True end-to-end sound",
+      metric_interrupt: "Interruption Stop",
+      metric_interrupt_hint: "Stop response & track clear",
 
       // Live interaction states
       turn_can_speak_lbl: "Ready to speak (mic active)",
@@ -280,6 +299,7 @@
       phase_can_continue: "Ready for more speech",
       phase_no_reply: "No reply generated this turn, please speak again",
       phase_interrupted: "Interrupted, {name} is listening",
+      phase_interrupted_with_time: "Interrupted (stopped in {ms}ms), {name} is listening",
       retry_read: "Retry Voice",
       retry_read_aria: "Retry reading this reply",
       tts_error_notice: "Voice synthesis timed out or failed; text reply preserved, click to retry reading.",

@@ -9,9 +9,11 @@ const names = {
   },
   assistant: window.ovcI18n ? window.ovcI18n.t("assistant_default_name") : "千夏",
 };
-const stageNames = ["asr", "llm", "tts"];
+const stageNames = ["asr", "llm", "tts", "net", "playback", "interrupt"];
 const charSelect = element("char-select");
 const ttsEngineSelect = element("tts-engine-select");
+const ttsStepsSelect = element("tts-steps-select");
+const ttsStepsRow = element("tts-steps-row");
 const voiceSelect = element("voice-select");
 const historyList = element("history-list");
 const newConversationButton = element("new-conversation");
@@ -140,10 +142,28 @@ function applyCharacter(c) {
   }
   const ttsSub = element("tts-sub");
   if (ttsSub) {
-    const engineLabel = c.tts_engine === "cosyvoice" ? "CosyVoice" : "GPT-SoVITS";
-    ttsSub.textContent = `${engineLabel} · ${names.assistant}`;
+    updateTtsSubHint();
   }
   updateMicStatus();
+}
+
+function updateTtsStepsVisibility() {
+  if (ttsStepsRow && ttsEngineSelect) {
+    ttsStepsRow.style.display = ttsEngineSelect.value === "gpt_sovits" ? "" : "none";
+  }
+}
+
+function updateTtsSubHint() {
+  const ttsSub = element("tts-sub");
+  if (!ttsSub) return;
+  const asst = names.assistant || t("assistant_default_name");
+  const engine = ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits";
+  if (engine === "gpt_sovits") {
+    const steps = ttsStepsSelect ? ttsStepsSelect.value : "8";
+    ttsSub.textContent = `GPT-SoVITS · ${asst} (${steps} steps)`;
+  } else {
+    ttsSub.textContent = `CosyVoice · ${asst}`;
+  }
 }
 
 function updateVoiceOptions() {
@@ -167,8 +187,13 @@ if (charSelect) {
 
 if (ttsEngineSelect) {
   ttsEngineSelect.addEventListener("change", () => {
+    updateTtsStepsVisibility();
     updateVoiceOptions();
+    updateTtsSubHint();
   });
+}
+if (ttsStepsSelect) {
+  ttsStepsSelect.addEventListener("change", updateTtsSubHint);
 }
 
 const drafts = new Map();
@@ -197,6 +222,34 @@ let resampleOffset = 0;
 const activeSources = new Set();
 let nextPlayTime = 0;
 let playStartTime = 0;
+
+let currentTurn = {
+  turnId: null,
+  startTime: 0,
+  asrMs: null,
+  llmFirstMs: null,
+  llmMs: null,
+  ttsMs: null,
+  firstChunkReceivedTime: null,
+  playbackLatencyMs: null,
+  networkQueueMs: null,
+  interruptionLatencyMs: null,
+  hasPlayedFirstChunk: false,
+};
+
+function resetTimings() {
+  for (const stage of stageNames) {
+    const el = element(stage);
+    if (el) el.textContent = "—";
+    const row = element(`${stage}-row`);
+    if (row) row.dataset.pending = "false";
+  }
+  const intRow = element("interrupt-row");
+  if (intRow) intRow.hidden = true;
+  element("llm-sub").textContent = t("metric_llm_sub");
+  updateTtsSubHint();
+}
+
 let isPlayingAudio = false;
 let serverGenerating = false;
 let hasPlayedAudioInTurn = false;
@@ -623,10 +676,50 @@ function queueAudioChunk(arrayBuffer) {
   const wasPlaying = activeSources.size > 0;
   activeSources.add(source);
   isPlayingAudio = true;
-  if (!wasPlaying) {
+  if (!wasPlaying || !currentTurn.hasPlayedFirstChunk) {
+    currentTurn.hasPlayedFirstChunk = true;
     playStartTime = performance.now();
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ action: "playback_started" }));
+
+    const scheduleDelayMs = Math.max(0, (startTime - now) * 1000);
+    const truePlaybackStartWallTime = performance.now() + scheduleDelayMs;
+    const truePlaybackLatencyMs = currentTurn.startTime > 0
+      ? Math.round(truePlaybackStartWallTime - currentTurn.startTime)
+      : null;
+    currentTurn.playbackLatencyMs = truePlaybackLatencyMs;
+
+    if (currentTurn.firstChunkReceivedTime && currentTurn.startTime > 0) {
+      const serverDuration = (currentTurn.asrMs || 0) + (currentTurn.llmMs || 0) + (currentTurn.ttsMs || 0);
+      const elapsedToArrival = Math.round(currentTurn.firstChunkReceivedTime - currentTurn.startTime);
+      currentTurn.networkQueueMs = Math.max(0, elapsedToArrival - serverDuration);
+    }
+
+    const onScheduledPlayback = () => {
+      if (currentTurn.playbackLatencyMs !== null) {
+        const playEl = element("playback");
+        if (playEl) playEl.textContent = duration(currentTurn.playbackLatencyMs);
+        const playRow = element("playback-row");
+        if (playRow) playRow.dataset.pending = "false";
+      }
+      if (currentTurn.networkQueueMs !== null) {
+        const netEl = element("net");
+        if (netEl) netEl.textContent = duration(currentTurn.networkQueueMs);
+        const netRow = element("net-row");
+        if (netRow) netRow.dataset.pending = "false";
+      }
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          action: "playback_started",
+          turn_id: currentTurn.turnId,
+          playback_latency_ms: currentTurn.playbackLatencyMs,
+          network_queue_ms: currentTurn.networkQueueMs,
+        }));
+      }
+    };
+
+    if (scheduleDelayMs > 4) {
+      setTimeout(onScheduledPlayback, scheduleDelayMs);
+    } else {
+      onScheduledPlayback();
     }
   }
   updateMicStatus();
@@ -641,7 +734,8 @@ function queueAudioChunk(arrayBuffer) {
   };
 }
 
-function stopAudioPlayback() {
+function stopAudioPlayback(reason = "normal") {
+  const interruptStart = performance.now();
   if (tailHangoverTimer) {
     clearTimeout(tailHangoverTimer);
     tailHangoverTimer = null;
@@ -659,6 +753,26 @@ function stopAudioPlayback() {
   activeSources.clear();
   nextPlayTime = 0;
   updateMicStatus();
+
+  if (reason === "interrupt" || reason === "stop_button") {
+    const interruptDurationMs = Math.max(1, Math.round(performance.now() - interruptStart));
+    currentTurn.interruptionLatencyMs = interruptDurationMs;
+    const intEl = element("interrupt");
+    if (intEl) intEl.textContent = duration(interruptDurationMs);
+    const intRow = element("interrupt-row");
+    if (intRow) {
+      intRow.hidden = false;
+      intRow.dataset.pending = "false";
+    }
+    phase(t("phase_interrupted_with_time", { name: names.assistant, ms: interruptDurationMs }));
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        action: "interrupted_metric",
+        turn_id: currentTurn.turnId,
+        interruption_latency_ms: interruptDurationMs,
+      }));
+    }
+  }
 }
 
 async function startAudioRecording() {
@@ -765,7 +879,7 @@ function stopAudioRecording() {
     micStream.getTracks().forEach((track) => track.stop());
     micStream = null;
   }
-  stopAudioPlayback();
+  stopAudioPlayback("stop_button");
 }
 
 function setState(next) {
@@ -958,16 +1072,35 @@ function onEvent(event) {
       }
       updateMicStatus();
       break;
+    case "turn_start":
+      currentTurn.turnId = event.turn_id;
+      if (currentTurn.startTime === 0) {
+        currentTurn.startTime = performance.now();
+      }
+      break;
     case "speech_start":
       serverGenerating = false;
       hasPlayedAudioInTurn = false;
       notice();
       finishDrafts();
-      for (const stage of stageNames) element(stage).textContent = "—";
-      element("llm-sub").textContent = t("metric_llm_sub");
+      resetTimings();
+      currentTurn = {
+        turnId: null,
+        startTime: performance.now(),
+        asrMs: null,
+        llmFirstMs: null,
+        llmMs: null,
+        ttsMs: null,
+        firstChunkReceivedTime: null,
+        playbackLatencyMs: null,
+        networkQueueMs: null,
+        interruptionLatencyMs: null,
+        hasPlayedFirstChunk: false,
+      };
       phase(t("phase_asr_recognizing"), "asr");
       break;
     case "endpoint":
+      currentTurn.startTime = performance.now();
       phase(t("phase_asr_finalizing"), "asr");
       break;
     case "user_partial": showMessage("user", event.text, true); break;
@@ -1009,12 +1142,20 @@ function onEvent(event) {
     case "timing":
       if (!Number.isFinite(event.milliseconds)) break;
       if (event.stage === "llm_first") {
+        currentTurn.llmFirstMs = event.milliseconds;
         element("llm-sub").textContent = t("metric_first_token", { ms: duration(event.milliseconds) });
       } else if (stageNames.includes(event.stage)) {
-        element(`${event.stage}-row`).dataset.pending = "false";
-        element(event.stage).textContent = (event.stage === "asr" && event.milliseconds === 0)
-          ? t("metric_text_input")
-          : duration(event.milliseconds);
+        if (event.stage === "asr") currentTurn.asrMs = event.milliseconds;
+        if (event.stage === "llm") currentTurn.llmMs = event.milliseconds;
+        if (event.stage === "tts") currentTurn.ttsMs = event.milliseconds;
+        const row = element(`${event.stage}-row`);
+        if (row) row.dataset.pending = "false";
+        const el = element(event.stage);
+        if (el) {
+          el.textContent = (event.stage === "asr" && event.milliseconds === 0)
+            ? t("metric_text_input")
+            : duration(event.milliseconds);
+        }
         if (event.stage === "tts") phase("");
       }
       break;
@@ -1031,9 +1172,8 @@ function onEvent(event) {
       break;
     case "interrupted":
       serverGenerating = false;
-      stopAudioPlayback();
+      stopAudioPlayback("interrupt");
       finishDrafts();
-      phase(t("phase_interrupted", { name: names.assistant }));
       break;
   }
 }
@@ -1048,6 +1188,9 @@ function connect() {
   });
   socket.addEventListener("message", (event) => {
     if (event.data instanceof ArrayBuffer) {
+      if (!currentTurn.firstChunkReceivedTime) {
+        currentTurn.firstChunkReceivedTime = performance.now();
+      }
       queueAudioChunk(event.data);
     } else {
       try {
@@ -1085,6 +1228,7 @@ button.addEventListener("click", async () => {
         character: charSelect ? charSelect.value : "mio",
         voice: voiceSelect ? voiceSelect.value : "chinatsu",
         tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
+        tts_steps: ttsStepsSelect ? (parseInt(ttsStepsSelect.value, 10) || 8) : 8,
         conversation_id: selectedConversationId,
       }));
     } catch (err) {
@@ -1130,7 +1274,27 @@ async function submitTextMessage() {
 
   textInput.value = "";
   if (state === "running") {
-    socket.send(JSON.stringify({ action: "text", text }));
+    resetTimings();
+    currentTurn = {
+      turnId: null,
+      startTime: performance.now(),
+      asrMs: 0,
+      llmFirstMs: null,
+      llmMs: null,
+      ttsMs: null,
+      firstChunkReceivedTime: null,
+      playbackLatencyMs: null,
+      networkQueueMs: null,
+      interruptionLatencyMs: null,
+      hasPlayedFirstChunk: false,
+    };
+    element("asr").textContent = t("metric_text_input");
+    element("asr-row").dataset.pending = "false";
+    socket.send(JSON.stringify({
+      action: "text",
+      text,
+      tts_steps: ttsStepsSelect ? (parseInt(ttsStepsSelect.value, 10) || 8) : 8,
+    }));
     phase(t("phase_llm_generating", { name: names.assistant }), "llm");
   } else if (state === "idle") {
     setState("starting");
@@ -1144,6 +1308,20 @@ async function submitTextMessage() {
         if (audioCtx.state === "suspended") await audioCtx.resume();
       } catch (e) {}
     }
+    resetTimings();
+    currentTurn = {
+      turnId: null,
+      startTime: performance.now(),
+      asrMs: 0,
+      llmFirstMs: null,
+      llmMs: null,
+      ttsMs: null,
+      firstChunkReceivedTime: null,
+      playbackLatencyMs: null,
+      networkQueueMs: null,
+      interruptionLatencyMs: null,
+      hasPlayedFirstChunk: false,
+    };
     socket.send(JSON.stringify({
       action: "start",
       text: text,
@@ -1153,6 +1331,7 @@ async function submitTextMessage() {
       character: charSelect ? charSelect.value : "mio",
       voice: voiceSelect ? voiceSelect.value : "chinatsu",
       tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
+      tts_steps: ttsStepsSelect ? (parseInt(ttsStepsSelect.value, 10) || 8) : 8,
       conversation_id: selectedConversationId,
     }));
   }
@@ -1176,6 +1355,7 @@ async function retrySpeakText(text) {
     character: charSelect ? charSelect.value : "mio",
     voice: voiceSelect ? voiceSelect.value : "chinatsu",
     tts_engine: ttsEngineSelect ? ttsEngineSelect.value : "gpt_sovits",
+    tts_steps: ttsStepsSelect ? (parseInt(ttsStepsSelect.value, 10) || 8) : 8,
     conversation_id: selectedConversationId,
   };
 
@@ -1203,6 +1383,8 @@ async function retrySpeakText(text) {
 
 populateCharacters(charactersData);
 updateVoiceOptions();
+updateTtsStepsVisibility();
+updateTtsSubHint();
 fetchVoicesAndCharacters();
 updateMicStatus();
 connect();
